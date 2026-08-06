@@ -1,0 +1,1347 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly VOLUME_TEMPLATE_ANNOTATION="harvesterhci.io/volumeClaimTemplates"
+readonly IMAGE_ID_ANNOTATION="harvesterhci.io/imageId"
+readonly STRESS_RUN_LABEL="csi.harvesterhci.io/stress-run"
+readonly STRESS_ITERATION_LABEL="csi.harvesterhci.io/stress-iteration"
+readonly CLOUD_INIT_PASSWORD="password1234"
+
+NAMESPACE="default"
+KUBECONFIG_PATH="${KUBECONFIG:-}"
+KUBECONFIG_FROM_OPTION=false
+IMAGE_URL=""
+IMAGE_STORAGE_CLASS=""
+DATA_STORAGE_CLASS=""
+CPU=""
+MEMORY=""
+REFERENCE_VM_MANIFEST=""
+ITERATIONS=""
+PARALLEL=1
+SSH_USER="ubuntu"
+SSH_IDENTITY_FILE=""
+SSH_PUBLIC_KEY=""
+CLOUD_INIT_USER_DATA=""
+CLOUD_INIT_NETWORK_DATA=""
+GUEST_DEVICE="/dev/vdb"
+GUEST_MOUNT_PATH="/mnt/csi-stress"
+ROOT_PAYLOAD_DIRECTORY="/var/lib/csi-stress"
+DATA_SIZE_GIB=10
+ROOT_DATA_SIZE_GIB=1
+TIMEOUT_SECONDS=3600
+POLL_INTERVAL_SECONDS=5
+KEEP_RESOURCES=false
+CLEANUP_MODE=false
+CLEANUP_RUN_ID=""
+
+RUN_ID=""
+IMAGE_NAME=""
+CURRENT_VM=""
+CURRENT_BACKUP=""
+CURRENT_RESTORE=""
+CURRENT_RESTORED_VM=""
+CURRENT_ITERATION=""
+CURRENT_BOOT_PVC=""
+STRESS_TMP_DIR=""
+LOG_PREFIX=""
+ACTIVE_PIDS=()
+
+usage() {
+	cat <<EOF
+Usage:
+  ${SCRIPT_NAME} \\
+    --image-url URL \\
+    --image-storage-class NAME \\
+    --data-storage-class NAME \\
+    --cpu COUNT \\
+    --memory QUANTITY \\
+    --vm-manifest PATH \\
+    --iterations COUNT [options]
+
+Cleanup:
+  ${SCRIPT_NAME} --cleanup [--namespace NAME] [--timeout SECONDS]
+  ${SCRIPT_NAME} --cleanup-run RUN_ID [--namespace NAME] [--timeout SECONDS]
+
+Required arguments:
+  --image-url URL          Source URL for the Harvester VirtualMachineImage.
+  --image-storage-class NAME
+                           StorageClass for the VM image and Block-mode boot disk.
+  --data-storage-class NAME
+                           StorageClass for the Filesystem-mode data PVC.
+  --cpu COUNT              Positive integer vCPU count for each test VM.
+  --memory QUANTITY        Kubernetes memory quantity, for example 4Gi.
+  --vm-manifest PATH       Existing kubevirt.io/v1 VirtualMachine manifest used as a template.
+  --iterations COUNT       Snapshot/restore iterations run by each worker.
+
+Options:
+  --namespace NAME         Namespace for all namespaced resources (default: default).
+  --kubeconfig PATH        Kubeconfig file to use. Defaults to the KUBECONFIG
+                           environment variable, then Kubernetes' standard lookup.
+  --parallel COUNT         Number of concurrent VM workflow workers (default: 1).
+  --data-size-gib COUNT    Random payload size in GiB (default: 10).
+  --root-data-size-gib COUNT
+                           Random root-disk payload size in GiB (default: 1).
+  --timeout SECONDS        Timeout for each asynchronous operation (default: 3600).
+  --poll-interval SECONDS  Status polling interval (default: 5).
+  --ssh-user USER          Cloud image's default SSH user (default: ubuntu).
+  --ssh-identity-file PATH Existing unencrypted private key to inject and use.
+                           By default, the script generates an ephemeral key.
+  --guest-device PATH      Guest data disk device (default: /dev/vdb).
+  --guest-mount-path PATH  Guest mount point (default: /mnt/csi-stress).
+  --keep-resources         Do not remove resources created by the script.
+  --cleanup                List and delete resources from every old stress run.
+  --cleanup-run RUN_ID     List and delete resources from one stress run.
+  -h, --help               Show this help.
+
+The reference VM must have:
+  * an image-backed PVC template for its boot disk; and
+  * a separate Filesystem-mode PVC disk with enough free capacity for the payload.
+
+The script creates the VMImage once. Each iteration inherits PVC capacities from
+the reference VM, while overriding the boot/data StorageClasses and volume modes.
+For example, --iterations 10 --parallel 3 starts three concurrent workers. Each
+worker runs ten VM, snapshot, restore, and integrity-check cycles (30 total).
+Parallel execution requires Bash 5.1 or newer.
+
+The reference VM must have a cloudInitNoCloud volume. The script replaces its
+configuration with Ubuntu password/key access, DHCP on enp1s0, and installation
+of qemu-guest-agent. It uses virtctl ssh and requires passwordless sudo, as
+provided by the default ubuntu cloud-image user.
+EOF
+}
+
+log() {
+	printf '[%s] %s%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$LOG_PREFIX" "$*"
+}
+
+fail() {
+	log "ERROR: $*" >&2
+	exit 1
+}
+
+require_positive_integer() {
+	local name="$1"
+	local value="$2"
+	[[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "${name} must be a positive integer, got ${value@Q}"
+}
+
+resource_name() {
+	local value="$1"
+	value="$(tr '[:upper:]_' '[:lower:]-' <<<"$value" | sed -E 's/[^a-z0-9.-]+/-/g; s/^[^a-z0-9]+//; s/[^a-z0-9]+$//')"
+	value="${value:0:63}"
+	value="$(sed -E 's/[^a-z0-9]+$//' <<<"$value")"
+	[[ -n "$value" ]] || return 1
+	printf '%s\n' "$value"
+}
+
+while (($# > 0)); do
+	case "$1" in
+	--image-url)
+		IMAGE_URL="${2:-}"
+		shift 2
+		;;
+	--image-storage-class)
+		IMAGE_STORAGE_CLASS="${2:-}"
+		shift 2
+		;;
+	--data-storage-class)
+		DATA_STORAGE_CLASS="${2:-}"
+		shift 2
+		;;
+	--cpu)
+		CPU="${2:-}"
+		shift 2
+		;;
+	--memory)
+		MEMORY="${2:-}"
+		shift 2
+		;;
+	--vm-manifest)
+		REFERENCE_VM_MANIFEST="${2:-}"
+		shift 2
+		;;
+	--iterations)
+		ITERATIONS="${2:-}"
+		shift 2
+		;;
+	--parallel)
+		PARALLEL="${2:-}"
+		shift 2
+		;;
+	--ssh-user)
+		SSH_USER="${2:-}"
+		shift 2
+		;;
+	--ssh-identity-file)
+		SSH_IDENTITY_FILE="${2:-}"
+		shift 2
+		;;
+	--namespace)
+		NAMESPACE="${2:-}"
+		shift 2
+		;;
+	--kubeconfig)
+		(($# >= 2)) && [[ -n "$2" ]] || fail "--kubeconfig requires a path"
+		KUBECONFIG_PATH="$2"
+		KUBECONFIG_FROM_OPTION=true
+		shift 2
+		;;
+	--data-size-gib)
+		DATA_SIZE_GIB="${2:-}"
+		shift 2
+		;;
+	--root-data-size-gib)
+		ROOT_DATA_SIZE_GIB="${2:-}"
+		shift 2
+		;;
+	--timeout)
+		TIMEOUT_SECONDS="${2:-}"
+		shift 2
+		;;
+	--poll-interval)
+		POLL_INTERVAL_SECONDS="${2:-}"
+		shift 2
+		;;
+	--guest-device)
+		GUEST_DEVICE="${2:-}"
+		shift 2
+		;;
+	--guest-mount-path)
+		GUEST_MOUNT_PATH="${2:-}"
+		shift 2
+		;;
+	--keep-resources)
+		KEEP_RESOURCES=true
+		shift
+		;;
+	--cleanup)
+		CLEANUP_MODE=true
+		shift
+		;;
+	--cleanup-run)
+		CLEANUP_MODE=true
+		CLEANUP_RUN_ID="${2:-}"
+		shift 2
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		usage >&2
+		fail "unknown argument: $1"
+		;;
+	esac
+done
+
+if [[ "$KUBECONFIG_FROM_OPTION" == true ]]; then
+	[[ -f "$KUBECONFIG_PATH" ]] || fail "kubeconfig file not found: ${KUBECONFIG_PATH@Q}"
+fi
+if [[ -n "$KUBECONFIG_PATH" ]]; then
+	export KUBECONFIG="$KUBECONFIG_PATH"
+fi
+
+if [[ "$CLEANUP_MODE" == true ]]; then
+	for required_command in kubectl jq; do
+		command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: ${required_command}"
+	done
+	[[ "$KEEP_RESOURCES" == false ]] || fail "--keep-resources cannot be used with cleanup mode"
+	if [[ -n "$CLEANUP_RUN_ID" ]]; then
+		[[ "$CLEANUP_RUN_ID" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] ||
+			fail "invalid --cleanup-run value: ${CLEANUP_RUN_ID@Q}"
+	fi
+	require_positive_integer "--timeout" "$TIMEOUT_SECONDS"
+else
+	if ((BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1))); then
+		fail "stress-test mode requires Bash 5.1 or newer"
+	fi
+	for required_command in kubectl jq virtctl base64 ssh-keygen; do
+		command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: ${required_command}"
+	done
+
+	[[ -n "$IMAGE_URL" ]] || fail "--image-url is required"
+	[[ -n "$IMAGE_STORAGE_CLASS" ]] || fail "--image-storage-class is required"
+	[[ -n "$DATA_STORAGE_CLASS" ]] || fail "--data-storage-class is required"
+	[[ -n "$CPU" ]] || fail "--cpu is required"
+	[[ -n "$MEMORY" ]] || fail "--memory is required"
+	[[ -n "$REFERENCE_VM_MANIFEST" ]] || fail "--vm-manifest is required"
+	[[ -n "$ITERATIONS" ]] || fail "--iterations is required"
+	[[ -f "$REFERENCE_VM_MANIFEST" ]] || fail "VM manifest not found: ${REFERENCE_VM_MANIFEST}"
+	if [[ -n "$SSH_IDENTITY_FILE" ]]; then
+		[[ -f "$SSH_IDENTITY_FILE" ]] || fail "SSH identity file not found: ${SSH_IDENTITY_FILE}"
+	fi
+	[[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || fail "invalid --ssh-user: ${SSH_USER@Q}"
+	[[ "$GUEST_DEVICE" =~ ^/dev/[a-zA-Z0-9._/-]+$ ]] || fail "invalid --guest-device: ${GUEST_DEVICE@Q}"
+	[[ "$GUEST_MOUNT_PATH" =~ ^/mnt/[a-zA-Z0-9._/-]+$ ]] ||
+		fail "--guest-mount-path must be a path below /mnt, got ${GUEST_MOUNT_PATH@Q}"
+
+	require_positive_integer "--cpu" "$CPU"
+	require_positive_integer "--iterations" "$ITERATIONS"
+	require_positive_integer "--parallel" "$PARALLEL"
+	require_positive_integer "--data-size-gib" "$DATA_SIZE_GIB"
+	require_positive_integer "--root-data-size-gib" "$ROOT_DATA_SIZE_GIB"
+	require_positive_integer "--timeout" "$TIMEOUT_SECONDS"
+	require_positive_integer "--poll-interval" "$POLL_INTERVAL_SECONDS"
+
+	RUN_ID="$(resource_name "csi-stress-$(date -u +%Y%m%d%H%M%S)-${RANDOM}")"
+	IMAGE_NAME="$(resource_name "${RUN_ID}-image")"
+	STRESS_TMP_DIR="$(mktemp -d)"
+	REFERENCE_VM_JSON="${STRESS_TMP_DIR}/reference-vm.json"
+
+	if [[ -z "$SSH_IDENTITY_FILE" ]]; then
+		SSH_IDENTITY_FILE="${STRESS_TMP_DIR}/id_ed25519"
+		ssh-keygen -q -t ed25519 -N '' -C "$RUN_ID" -f "$SSH_IDENTITY_FILE"
+	fi
+	SSH_PUBLIC_KEY="$(ssh-keygen -y -P '' -f "$SSH_IDENTITY_FILE")" ||
+		fail "unable to read an unencrypted private key from ${SSH_IDENTITY_FILE}"
+
+	CLOUD_INIT_USER_DATA="$(printf '%s\n' \
+		'#cloud-config' \
+		"password: ${CLOUD_INIT_PASSWORD}" \
+		'chpasswd: { expire: False }' \
+		'ssh_pwauth: True' \
+		'ssh_authorized_keys:' \
+		"- ${SSH_PUBLIC_KEY}" \
+		'package_update: true' \
+		'packages:' \
+		'- qemu-guest-agent' \
+		'runcmd:' \
+		'- [systemctl, enable, --now, qemu-guest-agent.service]')"
+
+	CLOUD_INIT_NETWORK_DATA="$(printf '%s\n' \
+		'network:' \
+		'  ethernets:' \
+		'    enp1s0:' \
+		'      dhcp4: true' \
+		'      dhcp6: true' \
+		'      dhcp-identifier: mac' \
+		'  version: 2')"
+fi
+
+wait_for_resource() {
+	local resource="$1"
+	local name="$2"
+	local expression="$3"
+	local description="$4"
+	local failure_expression="${5:-false}"
+	local deadline=$((SECONDS + TIMEOUT_SECONDS))
+	local object=""
+
+	log "Waiting for ${description}: ${resource}/${name}"
+	while ((SECONDS < deadline)); do
+		if object="$(kubectl get "$resource" "$name" -n "$NAMESPACE" -o json 2>/dev/null)"; then
+			if jq -e "$expression" >/dev/null 2>&1 <<<"$object"; then
+				log "Ready: ${resource}/${name}"
+				return 0
+			fi
+			if jq -e "$failure_expression" >/dev/null 2>&1 <<<"$object"; then
+				log "${description} failed: ${resource}/${name}" >&2
+				kubectl get "$resource" "$name" -n "$NAMESPACE" -o yaml >&2 2>/dev/null || true
+				return 1
+			fi
+		fi
+		sleep "$POLL_INTERVAL_SECONDS"
+	done
+
+	log "Timed out waiting for ${resource}/${name}; current state follows" >&2
+	kubectl get "$resource" "$name" -n "$NAMESPACE" -o yaml >&2 2>/dev/null || true
+	return 1
+}
+
+launcher_pod_json() {
+	local vm_name="$1"
+	kubectl get pods -n "$NAMESPACE" -o json | jq -c --arg vm "$vm_name" '
+        [
+          .items[]
+          | select(.metadata.deletionTimestamp == null)
+          | select(.metadata.labels["kubevirt.io"] == "virt-launcher")
+          | select(
+              .metadata.labels["vm.kubevirt.io/name"] == $vm or
+              .metadata.labels["kubevirt.io/domain"] == $vm
+            )
+        ]
+        | sort_by(.metadata.creationTimestamp)
+        | last // empty
+      '
+}
+
+wait_for_launcher_absent() {
+	local vm_name="$1"
+	local deadline=$((SECONDS + TIMEOUT_SECONDS))
+
+	log "Waiting for the virt-launcher pod for VM ${vm_name} to stop"
+	while ((SECONDS < deadline)); do
+		if [[ -z "$(launcher_pod_json "$vm_name")" ]]; then
+			return 0
+		fi
+		sleep "$POLL_INTERVAL_SECONDS"
+	done
+
+	log "Timed out waiting for VM ${vm_name} to stop" >&2
+	return 1
+}
+
+virtctl_ssh() {
+	local vm_name="$1"
+	local command="$2"
+
+	virtctl ssh \
+		--namespace "$NAMESPACE" \
+		--username "$SSH_USER" \
+		--identity-file "$SSH_IDENTITY_FILE" \
+		--known-hosts /dev/null \
+		--local-ssh-opts="-o StrictHostKeyChecking=no" \
+		--local-ssh-opts="-o BatchMode=yes" \
+		--local-ssh-opts="-o ConnectTimeout=10" \
+		--command "$command" \
+		"vm/${vm_name}"
+}
+
+wait_for_guest_ssh() {
+	local vm_name="$1"
+	local deadline=$((SECONDS + TIMEOUT_SECONDS))
+
+	log "Waiting for SSH access to VM ${vm_name}"
+	while ((SECONDS < deadline)); do
+		if virtctl_ssh "$vm_name" \
+			"command -v base64 >/dev/null && command -v bash >/dev/null && sudo -n true" >/dev/null 2>&1; then
+			log "SSH and passwordless sudo are ready on VM ${vm_name}"
+			return 0
+		fi
+		sleep "$POLL_INTERVAL_SECONDS"
+	done
+
+	log "Timed out waiting for SSH access to VM ${vm_name}" >&2
+	return 1
+}
+
+run_guest_script() {
+	local vm_name="$1"
+	local script="$2"
+	shift 2
+
+	local encoded_script=""
+	local remote_command=""
+	local argument=""
+	local quoted_argument=""
+
+	encoded_script="$(printf '%s' "$script" | base64 | tr -d '\n')"
+	remote_command="printf '%s' '${encoded_script}' | base64 -d | sudo -n bash -s --"
+	for argument in "$@"; do
+		printf -v quoted_argument '%q' "$argument"
+		remote_command+=" ${quoted_argument}"
+	done
+
+	virtctl_ssh "$vm_name" "$remote_command"
+}
+
+write_root_payload() {
+	local vm_name="$1"
+	local payload_name="$2"
+	local size_mib=$((ROOT_DATA_SIZE_GIB * 1024))
+
+	run_guest_script "$vm_name" 'set -Eeuo pipefail
+
+payload_directory="$1"
+payload_name="$2"
+size_mib="$3"
+
+for command in cut dd df findmnt mkdir sha256sum sync tail; do
+  command -v "$command" >/dev/null || { echo "required guest command not found: $command" >&2; exit 1; }
+done
+
+mkdir -p "$payload_directory"
+mount_target="$(findmnt -rn -T "$payload_directory" -o TARGET)"
+mount_source="$(findmnt -rn -T "$payload_directory" -o SOURCE)"
+if [[ "$mount_target" != "/" ]]; then
+  echo "root payload directory is mounted on $mount_target, not the root filesystem" >&2
+  exit 1
+fi
+
+payload_path="${payload_directory}/${payload_name}"
+payload_bytes=$((size_mib * 1024 * 1024))
+available_bytes="$(df --output=avail -B1 "$payload_directory" | tail -n 1)"
+if ((available_bytes < payload_bytes)); then
+  echo "insufficient root-filesystem space: need $payload_bytes bytes, have $available_bytes bytes" >&2
+  exit 1
+fi
+dd if=/dev/urandom of="$payload_path" bs=1M count="$size_mib" conv=fsync status=none >&2
+sync
+sha256sum "$payload_path" | cut -d " " -f1
+' "$ROOT_PAYLOAD_DIRECTORY" "$payload_name" "$size_mib"
+}
+
+read_root_payload() {
+	local vm_name="$1"
+	local payload_name="$2"
+
+	run_guest_script "$vm_name" 'set -Eeuo pipefail
+
+payload_directory="$1"
+payload_name="$2"
+
+for command in cut findmnt sha256sum; do
+  command -v "$command" >/dev/null || { echo "required guest command not found: $command" >&2; exit 1; }
+done
+test -d "$payload_directory" || { echo "restored root payload directory not found: $payload_directory" >&2; exit 1; }
+mount_target="$(findmnt -rn -T "$payload_directory" -o TARGET)"
+if [[ "$mount_target" != "/" ]]; then
+  echo "restored root payload directory is mounted on $mount_target, not the root filesystem" >&2
+  exit 1
+fi
+
+payload_path="${payload_directory}/${payload_name}"
+test -f "$payload_path" || { echo "restored root payload not found: $payload_path" >&2; exit 1; }
+sha256sum "$payload_path" | cut -d " " -f1
+' "$ROOT_PAYLOAD_DIRECTORY" "$payload_name"
+}
+
+write_guest_payload() {
+	local vm_name="$1"
+	local payload_name="$2"
+	local size_mib=$((DATA_SIZE_GIB * 1024))
+
+	run_guest_script "$vm_name" 'set -Eeuo pipefail
+
+device="$1"
+mount_path="$2"
+payload_name="$3"
+size_mib="$4"
+
+for command in blkid cut dd df findmnt grep head lsblk mkdir mkfs.ext4 mount mountpoint readlink sha256sum sync tail wipefs; do
+  command -v "$command" >/dev/null || { echo "required guest command not found: $command" >&2; exit 1; }
+done
+test -b "$device" || { echo "guest data device is not a block device: $device" >&2; exit 1; }
+
+device_real="$(readlink -f "$device")"
+root_source="$(findmnt -n -o SOURCE /)"
+if lsblk -sno PATH "$root_source" | grep -Fxq "$device_real"; then
+  echo "refusing to use root-disk device: $device_real" >&2
+  exit 1
+fi
+
+set +e
+fs_type="$(blkid -p -s TYPE -o value "$device" 2>/dev/null)"
+blkid_exit_code=$?
+set -e
+case "$blkid_exit_code" in
+0)
+  if [[ "$fs_type" != "ext4" ]]; then
+    echo "guest data device has unsupported filesystem $fs_type; expected ext4" >&2
+    exit 1
+  fi
+  ;;
+2)
+  signatures="$(wipefs --no-act --noheadings --output TYPE "$device")"
+  if [[ -n "${signatures//[[:space:]]/}" ]]; then
+    echo "guest data device has an unrecognized signature; refusing to format" >&2
+    exit 1
+  fi
+  mkfs.ext4 -F "$device" >&2
+  ;;
+8)
+  echo "guest data device has ambiguous signatures; refusing to format" >&2
+  exit 1
+  ;;
+*)
+  echo "unable to detect the guest data filesystem; blkid exited with $blkid_exit_code" >&2
+  exit 1
+  ;;
+esac
+
+mkdir -p "$mount_path"
+existing_target="$(findmnt -rn -S "$device" -o TARGET | head -n 1 || true)"
+if [[ -n "$existing_target" && "$existing_target" != "$mount_path" ]]; then
+  echo "guest data device is already mounted at $existing_target" >&2
+  exit 1
+fi
+if mountpoint -q "$mount_path"; then
+  mounted_source="$(findmnt -rn -T "$mount_path" -o SOURCE)"
+  if [[ "$(readlink -f "$mounted_source")" != "$device_real" ]]; then
+    echo "guest mount path is occupied by $mounted_source, not $device_real" >&2
+    exit 1
+  fi
+else
+  mount "$device" "$mount_path"
+fi
+
+payload_path="${mount_path}/${payload_name}"
+payload_bytes=$((size_mib * 1024 * 1024))
+available_bytes="$(df --output=avail -B1 "$mount_path" | tail -n 1)"
+if ((available_bytes < payload_bytes)); then
+  echo "insufficient guest data-disk space: need $payload_bytes bytes, have $available_bytes bytes" >&2
+  exit 1
+fi
+dd if=/dev/urandom of="$payload_path" bs=1M count="$size_mib" conv=fsync status=none >&2
+sync
+sha256sum "$payload_path" | cut -d " " -f1
+' "$GUEST_DEVICE" "$GUEST_MOUNT_PATH" "$payload_name" "$size_mib"
+}
+
+read_guest_payload() {
+	local vm_name="$1"
+	local payload_name="$2"
+
+	run_guest_script "$vm_name" 'set -Eeuo pipefail
+
+device="$1"
+mount_path="$2"
+payload_name="$3"
+
+for command in blkid cut findmnt head mkdir mount mountpoint readlink sha256sum; do
+  command -v "$command" >/dev/null || { echo "required guest command not found: $command" >&2; exit 1; }
+done
+test -b "$device" || { echo "guest data device is not a block device: $device" >&2; exit 1; }
+device_real="$(readlink -f "$device")"
+fs_type="$(blkid -p -s TYPE -o value "$device")"
+[[ "$fs_type" == "ext4" ]] || { echo "restored guest data device is not ext4: $fs_type" >&2; exit 1; }
+
+mkdir -p "$mount_path"
+existing_target="$(findmnt -rn -S "$device" -o TARGET | head -n 1 || true)"
+if [[ -n "$existing_target" && "$existing_target" != "$mount_path" ]]; then
+  echo "restored guest data device is already mounted at $existing_target" >&2
+  exit 1
+fi
+if mountpoint -q "$mount_path"; then
+  mounted_source="$(findmnt -rn -T "$mount_path" -o SOURCE)"
+  if [[ "$(readlink -f "$mounted_source")" != "$device_real" ]]; then
+    echo "restored guest mount path is occupied by $mounted_source, not $device_real" >&2
+    exit 1
+  fi
+else
+  mount "$device" "$mount_path"
+fi
+
+payload_path="${mount_path}/${payload_name}"
+test -f "$payload_path" || { echo "restored payload not found: $payload_path" >&2; exit 1; }
+sha256sum "$payload_path" | cut -d " " -f1
+' "$GUEST_DEVICE" "$GUEST_MOUNT_PATH" "$payload_name"
+}
+
+delete_resource() {
+	local resource="$1"
+	local name="$2"
+	[[ -n "$name" ]] || return 0
+	kubectl delete "$resource" "$name" -n "$NAMESPACE" \
+		--ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s" >/dev/null ||
+		log "WARNING: failed to delete ${resource}/${name}" >&2
+}
+
+label_boot_storage_resources() {
+	local name="$1"
+	local iteration="$2"
+	local labels=(
+		"${STRESS_RUN_LABEL}=${RUN_ID}"
+		"${STRESS_ITERATION_LABEL}=${iteration}"
+	)
+
+	kubectl label pvc "$name" -n "$NAMESPACE" "${labels[@]}" --overwrite >/dev/null
+	if kubectl get datavolumes.cdi.kubevirt.io "$name" -n "$NAMESPACE" >/dev/null 2>&1; then
+		kubectl label datavolumes.cdi.kubevirt.io "$name" -n "$NAMESPACE" \
+			"${labels[@]}" --overwrite >/dev/null
+	fi
+}
+
+label_restored_resources() {
+	local vm_name="$1"
+	local iteration="$2"
+	local labels=(
+		"${STRESS_RUN_LABEL}=${RUN_ID}"
+		"${STRESS_ITERATION_LABEL}=${iteration}"
+	)
+	local template_label_patch=""
+	local claim_name=""
+
+	kubectl label virtualmachines.kubevirt.io "$vm_name" -n "$NAMESPACE" \
+		"${labels[@]}" --overwrite >/dev/null
+	template_label_patch="$(jq -nc \
+		--arg runLabel "$STRESS_RUN_LABEL" \
+		--arg run "$RUN_ID" \
+		--arg iterationLabel "$STRESS_ITERATION_LABEL" \
+		--arg iteration "$iteration" '
+          {
+            spec: {
+              template: {
+                metadata: {
+                  labels: {
+                    ($runLabel): $run,
+                    ($iterationLabel): $iteration
+                  }
+                }
+              }
+            }
+          }
+        ')"
+	kubectl patch virtualmachines.kubevirt.io "$vm_name" -n "$NAMESPACE" \
+		--type merge -p "$template_label_patch" >/dev/null
+
+	if kubectl get virtualmachineinstances.kubevirt.io "$vm_name" -n "$NAMESPACE" >/dev/null 2>&1; then
+		kubectl label virtualmachineinstances.kubevirt.io "$vm_name" -n "$NAMESPACE" \
+			"${labels[@]}" --overwrite >/dev/null
+	fi
+
+	while IFS= read -r claim_name; do
+		[[ -n "$claim_name" ]] || continue
+		kubectl label pvc "$claim_name" -n "$NAMESPACE" "${labels[@]}" --overwrite >/dev/null
+		if kubectl get datavolumes.cdi.kubevirt.io "$claim_name" -n "$NAMESPACE" >/dev/null 2>&1; then
+			kubectl label datavolumes.cdi.kubevirt.io "$claim_name" -n "$NAMESPACE" \
+				"${labels[@]}" --overwrite >/dev/null
+		fi
+	done < <(
+		kubectl get virtualmachines.kubevirt.io "$vm_name" -n "$NAMESPACE" -o json |
+			jq -r '.spec.template.spec.volumes[]?.persistentVolumeClaim.claimName? // empty'
+	)
+}
+
+delete_resources_by_selector() {
+	local resource="$1"
+	local selector="$2"
+
+	kubectl delete "$resource" -n "$NAMESPACE" -l "$selector" \
+		--ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s" >/dev/null ||
+		log "WARNING: failed to delete one or more ${resource} resources" >&2
+}
+
+delete_resources_by_name_prefix() {
+	local resource="$1"
+	local prefix="$2"
+	local name=""
+
+	while IFS= read -r name; do
+		[[ -n "$name" ]] || continue
+		delete_resource "$resource" "$name"
+	done < <(
+		kubectl get "$resource" -n "$NAMESPACE" -o json |
+			jq -r --arg prefix "$prefix" '.items[].metadata.name | select(startswith($prefix))'
+	)
+}
+
+cleanup_old_runs() {
+	local selector="$STRESS_RUN_LABEL"
+	local resource_set="virtualmachineimages.harvesterhci.io,virtualmachinebackups.harvesterhci.io,virtualmachinerestores.harvesterhci.io,virtualmachines.kubevirt.io,virtualmachineinstances.kubevirt.io,volumesnapshots.snapshot.storage.k8s.io,datavolumes.cdi.kubevirt.io,pvc,pods"
+	local name_prefix="csi-stress-"
+	local restore_storage_prefix="restore-csi-stress-"
+	local restore_name=""
+	local target_vm=""
+	local remaining=""
+	local cleanup_failed=false
+
+	if [[ -n "$CLEANUP_RUN_ID" ]]; then
+		selector="${STRESS_RUN_LABEL}=${CLEANUP_RUN_ID}"
+		name_prefix="$CLEANUP_RUN_ID"
+		restore_storage_prefix="restore-${CLEANUP_RUN_ID}-"
+	fi
+
+	kubectl get namespace "$NAMESPACE" >/dev/null
+	log "Stress-test resources selected by ${selector@Q} in namespace ${NAMESPACE}:"
+	kubectl get "$resource_set" -n "$NAMESPACE" -l "$selector" -o wide || true
+	log "Unlabeled stress-test resources selected by name prefix ${name_prefix@Q}:"
+	kubectl get virtualmachineimages.harvesterhci.io,virtualmachines.kubevirt.io,virtualmachineinstances.kubevirt.io,datavolumes.cdi.kubevirt.io,pvc -n "$NAMESPACE" -o json |
+		jq -r --arg prefix "$name_prefix" --arg restorePrefix "$restore_storage_prefix" '
+          .items[]
+          | select(
+              (.metadata.name | startswith($prefix)) or
+              (.metadata.name | startswith($restorePrefix))
+            )
+          | [.kind, .metadata.name, (.status.phase // "")]
+          | @tsv
+        '
+
+	# A restored VM may not retain the stress-test labels. Resolve and delete each
+	# target from the labeled restore before removing the restore itself.
+	while IFS=$'\t' read -r restore_name target_vm; do
+		[[ -n "$restore_name" ]] || continue
+		delete_resource virtualmachines.kubevirt.io "$target_vm"
+		if [[ -n "$target_vm" ]] && kubectl get virtualmachines.kubevirt.io "$target_vm" \
+			-n "$NAMESPACE" >/dev/null 2>&1; then
+			log "WARNING: restored VM ${target_vm} still exists" >&2
+			cleanup_failed=true
+		fi
+	done < <(
+		kubectl get virtualmachinerestores.harvesterhci.io -n "$NAMESPACE" \
+			-l "$selector" -o json |
+			jq -r '.items[] | [.metadata.name, (.spec.target.name // "")] | @tsv'
+	)
+
+	delete_resources_by_selector virtualmachinerestores.harvesterhci.io "$selector"
+	# Delete backups while their source VMs and PVCs still exist so snapshot
+	# topology can be resolved by the CSI driver.
+	delete_resources_by_selector virtualmachinebackups.harvesterhci.io "$selector"
+	# Remove any labeled VolumeSnapshot left behind by an interrupted controller.
+	delete_resources_by_selector volumesnapshots.snapshot.storage.k8s.io "$selector"
+	delete_resources_by_selector virtualmachines.kubevirt.io "$selector"
+	delete_resources_by_name_prefix virtualmachines.kubevirt.io "$name_prefix"
+	delete_resources_by_selector virtualmachineinstances.kubevirt.io "$selector"
+	delete_resources_by_name_prefix virtualmachineinstances.kubevirt.io "$name_prefix"
+	delete_resources_by_selector pods "$selector"
+	delete_resources_by_selector virtualmachineimages.harvesterhci.io "$selector"
+	delete_resources_by_name_prefix virtualmachineimages.harvesterhci.io "$name_prefix"
+	delete_resources_by_selector datavolumes.cdi.kubevirt.io "$selector"
+	delete_resources_by_name_prefix datavolumes.cdi.kubevirt.io "$name_prefix"
+	delete_resources_by_name_prefix datavolumes.cdi.kubevirt.io "$restore_storage_prefix"
+	delete_resources_by_selector pvc "$selector"
+	delete_resources_by_name_prefix pvc "$name_prefix"
+	delete_resources_by_name_prefix pvc "$restore_storage_prefix"
+
+	if ! remaining="$(kubectl get "$resource_set" -n "$NAMESPACE" -l "$selector" -o name)"; then
+		log "Unable to verify cleanup results" >&2
+		return 1
+	fi
+	if [[ -n "$remaining" ]]; then
+		log "Cleanup finished with resources still present:" >&2
+		printf '%s\n' "$remaining" >&2
+		return 1
+	fi
+	remaining="$(kubectl get virtualmachineimages.harvesterhci.io,virtualmachines.kubevirt.io,virtualmachineinstances.kubevirt.io,datavolumes.cdi.kubevirt.io,pvc -n "$NAMESPACE" -o json |
+		jq -r --arg prefix "$name_prefix" --arg restorePrefix "$restore_storage_prefix" '
+          .items[].metadata.name
+          | select(startswith($prefix) or startswith($restorePrefix))
+        ')"
+	if [[ -n "$remaining" ]]; then
+		log "Cleanup finished with CDI storage still present:" >&2
+		printf '%s\n' "$remaining" >&2
+		return 1
+	fi
+	if [[ "$cleanup_failed" == true ]]; then
+		return 1
+	fi
+
+	log "Cleanup completed; no labeled stress-test resources remain"
+}
+
+clear_iteration_state() {
+	CURRENT_VM=""
+	CURRENT_BACKUP=""
+	CURRENT_RESTORE=""
+	CURRENT_RESTORED_VM=""
+	CURRENT_ITERATION=""
+	CURRENT_BOOT_PVC=""
+}
+
+cleanup_iteration() {
+	[[ -n "$CURRENT_ITERATION" ]] || return 0
+	log "Cleaning resources from ${CURRENT_ITERATION}"
+
+	# VirtualMachineRestore defaults to deletionPolicy=delete. Stop and remove
+	# the target VM before deleting the restore CR and its restored PVCs.
+	delete_resource virtualmachines.kubevirt.io "$CURRENT_RESTORED_VM"
+	delete_resource virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE"
+	# Remove the backup while the source VM and PVs still exist so the CSI driver
+	# can resolve snapshot topology and delete every backend snapshot.
+	delete_resource virtualmachinebackups.harvesterhci.io "$CURRENT_BACKUP"
+	delete_resource virtualmachines.kubevirt.io "$CURRENT_VM"
+	delete_resource datavolumes.cdi.kubevirt.io "$CURRENT_BOOT_PVC"
+	delete_resource pvc "$CURRENT_BOOT_PVC"
+
+	kubectl delete pvc -n "$NAMESPACE" \
+		-l "${STRESS_RUN_LABEL}=${RUN_ID},${STRESS_ITERATION_LABEL}=${CURRENT_ITERATION}" \
+		--ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s" >/dev/null ||
+		log "WARNING: failed to delete one or more iteration PVCs" >&2
+
+	clear_iteration_state
+}
+
+cleanup_image() {
+	delete_resource virtualmachineimages.harvesterhci.io "$IMAGE_NAME"
+}
+
+dump_diagnostics() {
+	log "Stress-test resources at failure:" >&2
+	kubectl get virtualmachineimages.harvesterhci.io,virtualmachinebackups.harvesterhci.io,virtualmachinerestores.harvesterhci.io,virtualmachines.kubevirt.io,pvc,pods \
+		-n "$NAMESPACE" -l "${STRESS_RUN_LABEL}=${RUN_ID}" -o wide >&2 2>/dev/null || true
+}
+
+terminate_workers() {
+	local pid=""
+
+	((${#ACTIVE_PIDS[@]} > 0)) || return 0
+	log "Stopping ${#ACTIVE_PIDS[@]} active iteration worker(s)"
+	for pid in "${ACTIVE_PIDS[@]}"; do
+		kill -TERM "$pid" 2>/dev/null || true
+	done
+	for pid in "${ACTIVE_PIDS[@]}"; do
+		wait "$pid" 2>/dev/null || true
+	done
+	ACTIVE_PIDS=()
+}
+
+on_exit() {
+	local exit_code=$?
+	trap - EXIT INT TERM
+	terminate_workers
+
+	if ((exit_code != 0)); then
+		dump_diagnostics
+	fi
+	if [[ "$KEEP_RESOURCES" == false ]]; then
+		if ((exit_code != 0)) && [[ -n "$RUN_ID" ]]; then
+			# A parent process cannot see a background worker's shell-local state.
+			# Sweep by the run label and generated-name prefixes after all workers stop.
+			CLEANUP_RUN_ID="$RUN_ID"
+			cleanup_old_runs || true
+		else
+			cleanup_iteration || true
+			cleanup_image || true
+		fi
+	else
+		log "Keeping resources with label ${STRESS_RUN_LABEL}=${RUN_ID}"
+	fi
+	if [[ -n "$STRESS_TMP_DIR" && -d "$STRESS_TMP_DIR" ]]; then
+		rm -rf -- "$STRESS_TMP_DIR"
+	fi
+	exit "$exit_code"
+}
+
+if [[ "$CLEANUP_MODE" == true ]]; then
+	cleanup_old_runs
+	exit 0
+fi
+
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+kubectl get namespace "$NAMESPACE" >/dev/null
+kubectl get storageclass "$IMAGE_STORAGE_CLASS" >/dev/null
+kubectl get storageclass "$DATA_STORAGE_CLASS" >/dev/null
+kubectl create --dry-run=client -f "$REFERENCE_VM_MANIFEST" -o json >"$REFERENCE_VM_JSON"
+
+jq -e '.apiVersion == "kubevirt.io/v1" and .kind == "VirtualMachine"' "$REFERENCE_VM_JSON" >/dev/null ||
+	fail "--vm-manifest must contain one kubevirt.io/v1 VirtualMachine"
+jq -e --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" '
+  ((.metadata.annotations[$annotation] // "[]" | fromjson) | type == "array" and length > 0)
+' "$REFERENCE_VM_JSON" >/dev/null || fail "reference VM has no valid ${VOLUME_TEMPLATE_ANNOTATION} annotation"
+jq -e 'any(.spec.template.spec.volumes[]?; .cloudInitNoCloud? != null)' "$REFERENCE_VM_JSON" >/dev/null ||
+	fail "reference VM requires a cloudInitNoCloud volume"
+
+BOOT_TEMPLATE_INDEX="$(jq -r --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" --arg imageID "$IMAGE_ID_ANNOTATION" '
+  (.metadata.annotations[$annotation] | fromjson) as $templates
+  | (
+      [$templates | to_entries[] | select(.value.metadata.annotations[$imageID]? != null)][0].key //
+      [$templates | to_entries[] | select((.value.spec.volumeMode // "Filesystem") == "Block")][0].key //
+      empty
+    )
+' "$REFERENCE_VM_JSON")"
+[[ -n "$BOOT_TEMPLATE_INDEX" ]] || fail "could not identify an image-backed or Block-mode boot PVC template"
+
+DATA_TEMPLATE_INDEX="$(jq -r --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" --argjson boot "$BOOT_TEMPLATE_INDEX" '
+  (.metadata.annotations[$annotation] | fromjson) as $templates
+  | [$templates | to_entries[] | select(.key != $boot and (.value.spec.volumeMode // "Filesystem") == "Filesystem")][0].key // empty
+' "$REFERENCE_VM_JSON")"
+[[ -n "$DATA_TEMPLATE_INDEX" ]] || fail "reference VM requires a non-boot Filesystem-mode PVC template"
+
+DATA_ORIGINAL_PVC="$(jq -r --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" --argjson index "$DATA_TEMPLATE_INDEX" '
+  (.metadata.annotations[$annotation] | fromjson)[$index].metadata.name // empty
+' "$REFERENCE_VM_JSON")"
+[[ -n "$DATA_ORIGINAL_PVC" ]] || fail "filesystem PVC template has no metadata.name"
+
+DATA_VOLUME_NAME="$(jq -r --arg claim "$DATA_ORIGINAL_PVC" '
+  [.spec.template.spec.volumes[]? | select(.persistentVolumeClaim.claimName? == $claim)][0].name // empty
+' "$REFERENCE_VM_JSON")"
+[[ -n "$DATA_VOLUME_NAME" ]] || fail "could not map filesystem PVC ${DATA_ORIGINAL_PVC} to a VM volume"
+
+REFERENCE_RUN_STRATEGY="$(jq -r '.spec.runStrategy // empty' "$REFERENCE_VM_JSON")"
+[[ -n "$REFERENCE_RUN_STRATEGY" ]] || fail "reference VM must define spec.runStrategy"
+case "$REFERENCE_RUN_STRATEGY" in
+Halted | Manual)
+	fail "reference VM runStrategy ${REFERENCE_RUN_STRATEGY} does not automatically start a VMI"
+	;;
+esac
+
+log "Run ID: ${RUN_ID}"
+log "Reference boot PVC template index: ${BOOT_TEMPLATE_INDEX}"
+log "Filesystem data volume: ${DATA_VOLUME_NAME} (template index ${DATA_TEMPLATE_INDEX})"
+
+log "Creating VirtualMachineImage ${NAMESPACE}/${IMAGE_NAME}"
+jq -n \
+	--arg namespace "$NAMESPACE" \
+	--arg name "$IMAGE_NAME" \
+	--arg run "$RUN_ID" \
+	--arg runLabel "$STRESS_RUN_LABEL" \
+	--arg storageClass "$IMAGE_STORAGE_CLASS" \
+	--arg url "$IMAGE_URL" '
+  {
+    apiVersion: "harvesterhci.io/v1beta1",
+    kind: "VirtualMachineImage",
+    metadata: {
+      name: $name,
+      namespace: $namespace,
+      annotations: {"harvesterhci.io/storageClassName": $storageClass},
+      labels: {
+        ($runLabel): $run,
+        "harvesterhci.io/image-type": "raw_qcow2",
+        "harvesterhci.io/imageDisplayName": ($name + ".img")
+      }
+    },
+    spec: {
+      backend: "cdi",
+      checksum: "",
+      displayName: ($name + ".img"),
+      pvcName: "",
+      pvcNamespace: "",
+      retry: 3,
+      sourceType: "download",
+      targetStorageClassName: $storageClass,
+      url: $url
+    }
+  }
+' | kubectl apply -f - >/dev/null
+
+wait_for_resource virtualmachineimages.harvesterhci.io "$IMAGE_NAME" '
+  any(.status.conditions[]?; .type == "Imported" and .status == "True")
+' "VM image import" '
+  any(.status.conditions[]?; .type == "RetryLimitExceeded" and .status == "True")
+'
+
+create_iteration_vm() {
+	local iteration="$1"
+	local vm_json="$2"
+	local image_id="${NAMESPACE}/${IMAGE_NAME}"
+
+	jq \
+		--arg namespace "$NAMESPACE" \
+		--arg vm "$CURRENT_VM" \
+		--arg run "$RUN_ID" \
+		--arg iteration "$iteration" \
+		--arg runLabel "$STRESS_RUN_LABEL" \
+		--arg iterationLabel "$STRESS_ITERATION_LABEL" \
+		--arg templateAnnotation "$VOLUME_TEMPLATE_ANNOTATION" \
+		--arg imageAnnotation "$IMAGE_ID_ANNOTATION" \
+		--arg imageID "$image_id" \
+		--arg imageStorageClass "$IMAGE_STORAGE_CLASS" \
+		--arg dataStorageClass "$DATA_STORAGE_CLASS" \
+		--arg cloudInitUserData "$CLOUD_INIT_USER_DATA" \
+		--arg cloudInitNetworkData "$CLOUD_INIT_NETWORK_DATA" \
+		--arg memory "$MEMORY" \
+		--argjson cpu "$CPU" \
+		--argjson bootIndex "$BOOT_TEMPLATE_INDEX" \
+		--argjson dataIndex "$DATA_TEMPLATE_INDEX" '
+    (.metadata.annotations[$templateAnnotation] | fromjson) as $originalTemplates
+    | (
+        $originalTemplates
+        | to_entries
+        | map(
+            .key as $index
+            | .value as $template
+            | {
+                oldName: $template.metadata.name,
+                value: (
+                  $template
+                  | .metadata.name = ($vm + "-pvc-" + ($index | tostring))
+                  | .metadata.labels = ((.metadata.labels // {}) + {
+                      ($runLabel): $run,
+                      ($iterationLabel): $iteration
+                  })
+                  | if $index == $bootIndex then
+                      .metadata.annotations = ((.metadata.annotations // {}) + {($imageAnnotation): $imageID})
+                      | .spec.storageClassName = $imageStorageClass
+                      | .spec.accessModes = ["ReadWriteOnce"]
+                      | .spec.volumeMode = "Block"
+                    elif $index == $dataIndex then
+                      .spec.storageClassName = $dataStorageClass
+                      | .spec.accessModes = ["ReadWriteOnce"]
+                      | .spec.volumeMode = "Filesystem"
+                    else . end
+                )
+              }
+          )
+      ) as $templateEntries
+    | ($templateEntries | map({key: .oldName, value: .value.metadata.name}) | from_entries) as $claimNames
+    | ($templateEntries | map(.value)) as $newTemplates
+    | del(
+        .status,
+        .metadata.creationTimestamp,
+        .metadata.deletionTimestamp,
+        .metadata.finalizers,
+        .metadata.generateName,
+        .metadata.generation,
+        .metadata.managedFields,
+        .metadata.ownerReferences,
+        .metadata.resourceVersion,
+        .metadata.selfLink,
+        .metadata.uid
+      )
+    | .metadata.name = $vm
+    | .metadata.namespace = $namespace
+    | .metadata.labels = ((.metadata.labels // {}) + {
+        ($runLabel): $run,
+        ($iterationLabel): $iteration
+      })
+    | .metadata.annotations = ((.metadata.annotations // {}) + {
+        ($templateAnnotation): ($newTemplates | tojson)
+      })
+    | del(
+        .metadata.annotations["harvesterhci.io/mac-address"],
+        .metadata.annotations["kubevirt.io/latest-observed-api-version"],
+        .metadata.annotations["kubevirt.io/storage-observed-api-version"]
+      )
+    | .spec.template.metadata.labels = ((.spec.template.metadata.labels // {}) + {
+        "harvesterhci.io/vmName": $vm,
+        ($runLabel): $run,
+        ($iterationLabel): $iteration
+      })
+    | .spec.template.spec.hostname = $vm
+    | .spec.template.spec.domain.cpu.cores = $cpu
+    | .spec.template.spec.domain.cpu.sockets = 1
+    | .spec.template.spec.domain.cpu.threads = 1
+    | .spec.template.spec.domain.cpu.maxSockets = 1
+    | .spec.template.spec.domain.resources.limits.cpu = ($cpu | tostring)
+    | .spec.template.spec.domain.resources.requests.cpu = ($cpu | tostring)
+    | .spec.template.spec.domain.memory.guest = $memory
+    | .spec.template.spec.domain.resources.limits.memory = $memory
+    | .spec.template.spec.domain.resources.requests.memory = $memory
+    | del(
+        .spec.template.spec.domain.firmware.serial,
+        .spec.template.spec.domain.firmware.uuid
+      )
+    | .spec.template.spec.domain.devices.interfaces |= map(del(.macAddress))
+    | .spec.template.spec.volumes |= map(
+        if .persistentVolumeClaim.claimName? != null then
+          .persistentVolumeClaim.claimName = $claimNames[.persistentVolumeClaim.claimName]
+        elif .cloudInitNoCloud? != null then
+          .cloudInitNoCloud = {
+            userData: $cloudInitUserData,
+            networkData: $cloudInitNetworkData
+          }
+        else . end
+      )
+  ' "$REFERENCE_VM_JSON" >"$vm_json"
+
+	if jq -e '
+      .spec.template.spec.volumes[]?
+      | select(has("persistentVolumeClaim") and .persistentVolumeClaim.claimName == null)
+    ' "$vm_json" >/dev/null; then
+		fail "failed to map one or more PVC-backed VM volumes to generated claim names"
+	fi
+
+	kubectl apply -f "$vm_json" >/dev/null
+}
+
+run_iteration() {
+	local worker="$1"
+	local iteration="$2"
+	local iteration_id="worker-${worker}-iteration-${iteration}"
+	local VM_JSON=""
+	local DATA_PVC_NAME=""
+	local ROOT_PAYLOAD_NAME=""
+	local DATA_PAYLOAD_NAME=""
+	local ROOT_SOURCE_CHECKSUM=""
+	local DATA_SOURCE_CHECKSUM=""
+	local RESTORED_DATA_PVC=""
+	local ROOT_RESTORED_CHECKSUM=""
+	local DATA_RESTORED_CHECKSUM=""
+
+	CURRENT_ITERATION="$iteration_id"
+	CURRENT_VM="$(resource_name "${RUN_ID}-worker-${worker}-vm-${iteration}")"
+	CURRENT_BACKUP="$(resource_name "${RUN_ID}-worker-${worker}-snapshot-${iteration}")"
+	CURRENT_RESTORE="$(resource_name "${RUN_ID}-worker-${worker}-restore-${iteration}")"
+	CURRENT_RESTORED_VM="$(resource_name "${RUN_ID}-worker-${worker}-restored-${iteration}")"
+	VM_JSON="${STRESS_TMP_DIR}/worker-${worker}-vm-${iteration}.json"
+	CURRENT_BOOT_PVC="${CURRENT_VM}-pvc-${BOOT_TEMPLATE_INDEX}"
+	DATA_PVC_NAME="${CURRENT_VM}-pvc-${DATA_TEMPLATE_INDEX}"
+	ROOT_PAYLOAD_NAME=".csi-stress-${RUN_ID}-${iteration_id}-root.bin"
+	DATA_PAYLOAD_NAME=".csi-stress-${RUN_ID}-${iteration_id}-data.bin"
+
+	log "Starting iteration ${iteration}/${ITERATIONS}"
+	log "Creating VM ${NAMESPACE}/${CURRENT_VM}"
+	create_iteration_vm "$iteration_id" "$VM_JSON"
+	wait_for_resource virtualmachines.kubevirt.io "$CURRENT_VM" '.status.ready == true' "source VM"
+	wait_for_resource pvc "$CURRENT_BOOT_PVC" '.status.phase == "Bound"' "block boot PVC"
+	label_boot_storage_resources "$CURRENT_BOOT_PVC" "$iteration_id"
+	wait_for_resource pvc "$DATA_PVC_NAME" '.status.phase == "Bound"' "filesystem data PVC"
+	wait_for_guest_ssh "$CURRENT_VM"
+
+	log "Writing ${ROOT_DATA_SIZE_GIB} GiB of data to the source root disk in VM ${CURRENT_VM}"
+	ROOT_SOURCE_CHECKSUM="$(write_root_payload "$CURRENT_VM" "$ROOT_PAYLOAD_NAME")"
+	[[ "$ROOT_SOURCE_CHECKSUM" =~ ^[a-f0-9]{64}$ ]] ||
+		fail "invalid source root-disk checksum: ${ROOT_SOURCE_CHECKSUM@Q}"
+	log "Source root-disk checksum: ${ROOT_SOURCE_CHECKSUM}"
+
+	log "Writing ${DATA_SIZE_GIB} GiB of data to source data disk ${GUEST_DEVICE} in VM ${CURRENT_VM}"
+	DATA_SOURCE_CHECKSUM="$(write_guest_payload "$CURRENT_VM" "$DATA_PAYLOAD_NAME")"
+	[[ "$DATA_SOURCE_CHECKSUM" =~ ^[a-f0-9]{64}$ ]] ||
+		fail "invalid source data-disk checksum: ${DATA_SOURCE_CHECKSUM@Q}"
+	log "Source data-disk checksum: ${DATA_SOURCE_CHECKSUM}"
+
+	log "Creating VM snapshot ${NAMESPACE}/${CURRENT_BACKUP}"
+	jq -n \
+		--arg namespace "$NAMESPACE" \
+		--arg name "$CURRENT_BACKUP" \
+		--arg vm "$CURRENT_VM" \
+		--arg run "$RUN_ID" \
+		--arg iteration "$iteration_id" \
+		--arg runLabel "$STRESS_RUN_LABEL" \
+		--arg iterationLabel "$STRESS_ITERATION_LABEL" '
+      {
+        apiVersion: "harvesterhci.io/v1beta1",
+        kind: "VirtualMachineBackup",
+        metadata: {
+          name: $name,
+          namespace: $namespace,
+          annotations: {"harvesterhci.io/snapshotFreezeFS": "true"},
+          labels: {($runLabel): $run, ($iterationLabel): $iteration}
+        },
+        spec: {
+          source: {apiGroup: "kubevirt.io", kind: "VirtualMachine", name: $vm},
+          type: "snapshot"
+        }
+      }
+	    ' | kubectl apply -f - >/dev/null
+	wait_for_resource virtualmachinebackups.harvesterhci.io "$CURRENT_BACKUP" \
+		'.status.readyToUse == true' "VM snapshot" '.status.error.message? != null'
+
+	log "Stopping source VM ${CURRENT_VM} before starting its restored copy"
+	kubectl patch virtualmachines.kubevirt.io "$CURRENT_VM" -n "$NAMESPACE" \
+		--type merge -p '{"spec":{"runStrategy":"Halted"}}' >/dev/null
+	wait_for_launcher_absent "$CURRENT_VM"
+
+	log "Restoring snapshot ${CURRENT_BACKUP} to VM ${CURRENT_RESTORED_VM}"
+	jq -n \
+		--arg namespace "$NAMESPACE" \
+		--arg name "$CURRENT_RESTORE" \
+		--arg backup "$CURRENT_BACKUP" \
+		--arg restoredVM "$CURRENT_RESTORED_VM" \
+		--arg run "$RUN_ID" \
+		--arg iteration "$iteration_id" \
+		--arg runLabel "$STRESS_RUN_LABEL" \
+		--arg iterationLabel "$STRESS_ITERATION_LABEL" '
+      {
+        apiVersion: "harvesterhci.io/v1beta1",
+        kind: "VirtualMachineRestore",
+        metadata: {
+          name: $name,
+          namespace: $namespace,
+          labels: {($runLabel): $run, ($iterationLabel): $iteration}
+        },
+        spec: {
+          newVM: true,
+          target: {apiGroup: "kubevirt.io", kind: "VirtualMachine", name: $restoredVM},
+          virtualMachineBackupName: $backup,
+          virtualMachineBackupNamespace: $namespace
+        }
+      }
+    ' | kubectl apply -f - >/dev/null
+	wait_for_resource virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE" \
+		'.status.complete == true' "VM restore" '.status.error.message? != null'
+	wait_for_resource virtualmachines.kubevirt.io "$CURRENT_RESTORED_VM" '.status.ready == true' "restored VM"
+	label_restored_resources "$CURRENT_RESTORED_VM" "$iteration_id"
+
+	RESTORED_DATA_PVC="$(kubectl get virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE" -n "$NAMESPACE" -o json | jq -r --arg volume "$DATA_VOLUME_NAME" '
+      [.status.restores[]? | select(.volumeName == $volume)][0].persistentVolumeClaimSpec.metadata.name // empty
+    ')"
+	[[ -n "$RESTORED_DATA_PVC" ]] || fail "restore status does not contain a PVC for VM volume ${DATA_VOLUME_NAME}"
+	wait_for_resource pvc "$RESTORED_DATA_PVC" '.status.phase == "Bound"' "restored filesystem data PVC"
+	wait_for_guest_ssh "$CURRENT_RESTORED_VM"
+
+	log "Checking data checksum on the restored root disk in VM ${CURRENT_RESTORED_VM}"
+	ROOT_RESTORED_CHECKSUM="$(read_root_payload "$CURRENT_RESTORED_VM" "$ROOT_PAYLOAD_NAME")"
+	[[ "$ROOT_RESTORED_CHECKSUM" =~ ^[a-f0-9]{64}$ ]] ||
+		fail "invalid restored root-disk checksum: ${ROOT_RESTORED_CHECKSUM@Q}"
+	log "Restored root-disk checksum: ${ROOT_RESTORED_CHECKSUM}"
+
+	log "Checking data checksum on restored data disk ${GUEST_DEVICE} in VM ${CURRENT_RESTORED_VM}"
+	DATA_RESTORED_CHECKSUM="$(read_guest_payload "$CURRENT_RESTORED_VM" "$DATA_PAYLOAD_NAME")"
+	[[ "$DATA_RESTORED_CHECKSUM" =~ ^[a-f0-9]{64}$ ]] ||
+		fail "invalid restored data-disk checksum: ${DATA_RESTORED_CHECKSUM@Q}"
+	log "Restored data-disk checksum: ${DATA_RESTORED_CHECKSUM}"
+
+	if [[ "$ROOT_SOURCE_CHECKSUM" != "$ROOT_RESTORED_CHECKSUM" ]]; then
+		fail "root-disk integrity failure in ${iteration_id}: source=${ROOT_SOURCE_CHECKSUM}, restored=${ROOT_RESTORED_CHECKSUM}"
+	fi
+	if [[ "$DATA_SOURCE_CHECKSUM" != "$DATA_RESTORED_CHECKSUM" ]]; then
+		fail "data-disk integrity failure in ${iteration_id}: source=${DATA_SOURCE_CHECKSUM}, restored=${DATA_RESTORED_CHECKSUM}"
+	fi
+	log "Iteration ${iteration} passed root- and data-disk integrity verification"
+}
+
+worker_on_exit() {
+	local exit_code=$?
+	trap - EXIT INT TERM
+
+	if [[ "$KEEP_RESOURCES" == false ]]; then
+		cleanup_iteration || true
+	fi
+	exit "$exit_code"
+}
+
+run_iteration_worker() {
+	local worker="$1"
+	local iteration=0
+
+	trap worker_on_exit EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+
+	for ((iteration = 1; iteration <= ITERATIONS; iteration++)); do
+		LOG_PREFIX="[worker ${worker}, iteration ${iteration}] "
+		run_iteration "$worker" "$iteration"
+		if [[ "$KEEP_RESOURCES" == false ]]; then
+			cleanup_iteration
+		else
+			clear_iteration_state
+		fi
+	done
+
+	LOG_PREFIX="[worker ${worker}] "
+	log "Completed all ${ITERATIONS} iteration(s)"
+}
+
+remove_active_pid() {
+	local completed_pid="$1"
+	local pid=""
+	local remaining_pids=()
+
+	for pid in "${ACTIVE_PIDS[@]}"; do
+		if [[ "$pid" != "$completed_pid" ]]; then
+			remaining_pids+=("$pid")
+		fi
+	done
+	ACTIVE_PIDS=("${remaining_pids[@]}")
+}
+
+wait_for_one_worker() {
+	local completed_pid=""
+	local exit_code=0
+
+	if wait -n -p completed_pid "${ACTIVE_PIDS[@]}"; then
+		exit_code=0
+	else
+		exit_code=$?
+	fi
+	if [[ -n "${completed_pid:-}" ]]; then
+		remove_active_pid "$completed_pid"
+	fi
+	return "$exit_code"
+}
+
+run_iterations() {
+	local worker=0
+	local exit_code=0
+
+	for ((worker = 1; worker <= PARALLEL; worker++)); do
+		(run_iteration_worker "$worker") &
+		ACTIVE_PIDS+=("$!")
+	done
+
+	while ((${#ACTIVE_PIDS[@]} > 0)); do
+		if wait_for_one_worker; then
+			continue
+		else
+			exit_code=$?
+			log "An iteration worker failed with exit code ${exit_code}" >&2
+			terminate_workers
+			return "$exit_code"
+		fi
+	done
+}
+
+log "Starting ${PARALLEL} concurrent worker(s), ${ITERATIONS} iteration(s) each ($((PARALLEL * ITERATIONS)) total)"
+run_iterations
+
+if [[ "$KEEP_RESOURCES" == false ]]; then
+	cleanup_image
+fi
+
+log "All ${PARALLEL} worker(s) completed ${ITERATIONS} iteration(s) successfully ($((PARALLEL * ITERATIONS)) total)"

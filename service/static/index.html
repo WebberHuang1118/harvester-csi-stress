@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Harvester CSI Stress Test</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand-mark" aria-hidden="true">
+        <span></span><span></span><span></span>
+      </div>
+      <div>
+        <p class="eyebrow">Local control plane</p>
+        <h1>Harvester CSI Stress Test</h1>
+      </div>
+      <div class="local-badge"><span></span> localhost</div>
+    </header>
+
+    <main class="workspace">
+      <aside class="control-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Configuration</p>
+            <h2>New operation</h2>
+          </div>
+          <button class="text-button" id="resetButton" type="button">Reset defaults</button>
+        </div>
+
+        <form id="configForm">
+          <fieldset class="mode-fieldset">
+            <legend>Operation</legend>
+            <div class="mode-grid" id="modeGrid"></div>
+          </fieldset>
+          <div id="parameterGroups"></div>
+          <div class="form-error" id="formError" role="alert" hidden></div>
+          <div class="action-row">
+            <button class="primary-button" id="startButton" type="submit">
+              <span class="button-icon">▶</span>
+              Start operation
+            </button>
+            <button class="danger-button" id="stopButton" type="button" disabled>
+              <span class="button-icon">■</span>
+              Stop
+            </button>
+          </div>
+        </form>
+      </aside>
+
+      <section class="output-panel">
+        <div class="output-header">
+          <div>
+            <p class="eyebrow">Execution</p>
+            <div class="title-line">
+              <h2 id="jobTitle">No run selected</h2>
+              <span class="status-badge idle" id="statusBadge">Idle</span>
+            </div>
+          </div>
+          <label class="history-picker">
+            <span>Recent runs</span>
+            <select id="jobHistory">
+              <option value="">No runs yet</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="run-summary" id="runSummary" hidden>
+          <div class="summary-item">
+            <span class="summary-label">Progress</span>
+            <strong id="progressText">Preparing</strong>
+          </div>
+          <div class="summary-item">
+            <span class="summary-label">Run ID</span>
+            <strong id="runIdText">Pending</strong>
+          </div>
+          <div class="summary-item">
+            <span class="summary-label">Started</span>
+            <strong id="startedText">—</strong>
+          </div>
+          <div class="summary-item">
+            <span class="summary-label">Exit code</span>
+            <strong id="exitCodeText">—</strong>
+          </div>
+          <div class="progress-track" aria-label="Run progress">
+            <div class="progress-value" id="progressValue"></div>
+          </div>
+          <p class="current-activity" id="currentActivity">Waiting for output…</p>
+        </div>
+
+        <details class="command-panel" id="commandPanel" hidden>
+          <summary>Command</summary>
+          <div class="command-row">
+            <code id="commandText"></code>
+            <button class="copy-button" id="copyCommandButton" type="button">Copy</button>
+          </div>
+        </details>
+
+        <div class="log-toolbar">
+          <div class="filter-group" id="levelFilters" aria-label="Log filters">
+            <button class="filter-button active" data-filter="all" type="button">All</button>
+            <button class="filter-button" data-filter="activity" type="button">Activity</button>
+            <button class="filter-button" data-filter="warning" type="button">Warnings</button>
+            <button class="filter-button" data-filter="error" type="button">Errors</button>
+          </div>
+          <div class="log-tools">
+            <label class="search-box">
+              <span class="visually-hidden">Search output</span>
+              <input id="logSearch" type="search" placeholder="Filter output">
+            </label>
+            <label class="auto-scroll">
+              <input id="autoScroll" type="checkbox" checked>
+              Follow output
+            </label>
+            <button class="text-button" id="copyLogsButton" type="button" disabled>Copy output</button>
+            <button class="text-button" id="clearLogsButton" type="button">Clear view</button>
+          </div>
+        </div>
+
+        <div class="log-viewport" id="logViewport" aria-live="polite" aria-label="Process output">
+          <div class="empty-output" id="emptyOutput">
+            <div class="empty-glyph" aria-hidden="true">›_</div>
+            <h3>Ready when you are</h3>
+            <p>Configure an operation, start it, and its live output will appear here.</p>
+          </div>
+          <div class="log-list" id="logList"></div>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" hidden></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
