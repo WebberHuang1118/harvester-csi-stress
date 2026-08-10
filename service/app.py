@@ -98,8 +98,8 @@ PARAMETERS = [
         "required": True,
         "group": "VM and storage",
         "modes": ["stress"],
-        "placeholder": "block-storage-class",
-        "help": "StorageClass for the imported image and block-mode boot disk.",
+        "placeholder": "image-storage-class",
+        "help": "StorageClass used for the Harvester VM image and generated boot PVCs.",
     },
     {
         "key": "data_storage_class",
@@ -109,8 +109,8 @@ PARAMETERS = [
         "required": True,
         "group": "VM and storage",
         "modes": ["stress"],
-        "placeholder": "filesystem-storage-class",
-        "help": "StorageClass for the filesystem-mode data PVC.",
+        "placeholder": "data-storage-class",
+        "help": "StorageClass for generated data PVCs.",
     },
     {
         "key": "cpu",
@@ -134,14 +134,97 @@ PARAMETERS = [
         "help": "Kubernetes memory quantity assigned to each VM.",
     },
     {
-        "key": "vm_manifest",
-        "label": "Reference VM manifest",
-        "type": "text",
-        "default": str(ROOT_DIR / "scripts" / "vm-reference.yaml"),
+        "key": "boot_size_gib",
+        "label": "Boot PVC capacity",
+        "type": "number",
+        "default": 50,
+        "min": 1,
+        "suffix": "GiB",
         "required": True,
         "group": "VM and storage",
         "modes": ["stress"],
-        "help": "Local path to an existing kubevirt.io/v1 VirtualMachine manifest.",
+    },
+    {
+        "key": "data_volume_size_gib",
+        "label": "Data PVC capacity",
+        "type": "number",
+        "default": 100,
+        "min": 1,
+        "suffix": "GiB",
+        "required": True,
+        "group": "VM and storage",
+        "modes": ["stress"],
+    },
+    {
+        "key": "boot_volume_mode",
+        "label": "Boot volume mode",
+        "type": "select",
+        "options": ["Block", "Filesystem"],
+        "default": "Block",
+        "required": True,
+        "group": "VM and storage",
+        "modes": ["stress"],
+    },
+    {
+        "key": "data_volume_mode",
+        "label": "Data volume mode",
+        "type": "select",
+        "options": ["Filesystem", "Block"],
+        "default": "Filesystem",
+        "required": True,
+        "group": "VM and storage",
+        "modes": ["stress"],
+    },
+    {
+        "key": "boot_access_mode",
+        "label": "Boot access mode",
+        "type": "select",
+        "options": ["ReadWriteOnce", "ReadWriteMany", "ReadOnlyMany", "ReadWriteOncePod"],
+        "default": "ReadWriteOnce",
+        "required": True,
+        "group": "VM and storage",
+        "modes": ["stress"],
+    },
+    {
+        "key": "data_access_mode",
+        "label": "Data access mode",
+        "type": "select",
+        "options": ["ReadWriteOnce", "ReadWriteMany", "ReadOnlyMany", "ReadWriteOncePod"],
+        "default": "ReadWriteOnce",
+        "required": True,
+        "group": "VM and storage",
+        "modes": ["stress"],
+    },
+    {
+        "key": "network_name",
+        "label": "Multus network",
+        "type": "text",
+        "default": "default/mgmt-vlan",
+        "required": True,
+        "group": "VM network",
+        "modes": ["stress"],
+        "placeholder": "namespace/network-name",
+        "help": "NetworkAttachmentDefinition used by each VM.",
+    },
+    {
+        "key": "guest_interface_name",
+        "label": "Guest interface",
+        "type": "text",
+        "default": "enp1s0",
+        "required": True,
+        "group": "VM network",
+        "modes": ["stress"],
+        "help": "Linux network interface configured for DHCP by cloud-init.",
+    },
+    {
+        "key": "node_selector",
+        "label": "Required node selector",
+        "type": "text",
+        "default": "network.harvesterhci.io/mgmt=true",
+        "group": "VM network",
+        "modes": ["stress"],
+        "placeholder": "KEY=VALUE (empty disables affinity)",
+        "help": "Restricts VM scheduling to matching nodes. Clear this field to disable the selector.",
     },
     {
         "key": "iterations",
@@ -362,10 +445,18 @@ def normalize_config(payload: Any) -> dict[str, Any]:
     config["kubeconfig"] = validate_kubeconfig(config["kubeconfig"])
 
     if mode == "stress":
-        manifest = Path(config["vm_manifest"]).expanduser()
-        if not manifest.is_file():
-            raise ConfigError(f"Reference VM manifest not found: {manifest}")
-        config["vm_manifest"] = str(manifest.resolve())
+        for key in ("boot_volume_mode", "data_volume_mode", "boot_access_mode", "data_access_mode"):
+            options = PARAMETER_BY_KEY[key]["options"]
+            if config[key] not in options:
+                raise ConfigError(f"{PARAMETER_BY_KEY[key]['label']} must be one of: {', '.join(options)}")
+        if config["node_selector"]:
+            selector_key, separator, selector_value = config["node_selector"].partition("=")
+            if not separator or not selector_key or not selector_value:
+                raise ConfigError("Required node selector must use KEY=VALUE syntax")
+        if config["root_data_size_gib"] >= config["boot_size_gib"]:
+            raise ConfigError("Root-disk payload must be smaller than boot PVC capacity")
+        if config["data_size_gib"] >= config["data_volume_size_gib"]:
+            raise ConfigError("Data-disk payload must be smaller than data PVC capacity")
         if config["ssh_identity_file"]:
             identity = Path(config["ssh_identity_file"]).expanduser()
             if not identity.is_file():
@@ -396,7 +487,15 @@ def build_command(config: dict[str, Any]) -> list[str]:
             ("--data-storage-class", "data_storage_class"),
             ("--cpu", "cpu"),
             ("--memory", "memory"),
-            ("--vm-manifest", "vm_manifest"),
+            ("--boot-size-gib", "boot_size_gib"),
+            ("--data-volume-size-gib", "data_volume_size_gib"),
+            ("--boot-volume-mode", "boot_volume_mode"),
+            ("--data-volume-mode", "data_volume_mode"),
+            ("--boot-access-mode", "boot_access_mode"),
+            ("--data-access-mode", "data_access_mode"),
+            ("--network-name", "network_name"),
+            ("--guest-interface-name", "guest_interface_name"),
+            ("--node-selector", "node_selector"),
             ("--iterations", "iterations"),
             ("--parallel", "parallel"),
             ("--data-size-gib", "data_size_gib"),
@@ -481,6 +580,7 @@ class Job:
             return {
                 "id": self.id,
                 "mode": self.config["mode"],
+                "config": dict(self.config),
                 "status": self.status,
                 "started_at": self.started_at,
                 "ended_at": self.ended_at,

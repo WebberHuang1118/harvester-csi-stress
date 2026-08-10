@@ -170,6 +170,19 @@ legend, .group-title {
   box-shadow: 0 0 0 2px rgb(22 124 90 / 10%);
 }
 .mode-option input:focus-visible + label { outline: 2px solid #2d76c2; outline-offset: 2px; }
+.mode-option input:disabled + label {
+  cursor: not-allowed;
+  color: #74807c;
+  border-color: var(--line);
+  background: #eef2f0;
+  box-shadow: none;
+}
+.mode-option input:checked:disabled + label {
+  border-color: #9daaa5;
+  background: #e3e9e6;
+  box-shadow: inset 3px 0 0 #81928b;
+}
+.mode-option input:disabled + label .mode-description { color: #89938f; }
 .mode-label { display: block; margin-bottom: 4px; font-size: .76rem; font-weight: 800; }
 .mode-description { display: block; color: var(--muted); font-size: .66rem; line-height: 1.3; }
 
@@ -194,7 +207,7 @@ legend, .group-title {
 }
 .required-mark { color: var(--red); }
 .input-wrap { position: relative; }
-.input-wrap input {
+.input-wrap input, .input-wrap select {
   width: 100%;
   height: 38px;
   padding: 8px 10px;
@@ -206,8 +219,16 @@ legend, .group-title {
   font-size: .79rem;
   transition: border .15s, box-shadow .15s;
 }
-.input-wrap input:hover { border-color: #9fafaa; }
-.input-wrap input:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgb(22 124 90 / 11%); }
+.input-wrap input:hover, .input-wrap select:hover { border-color: #9fafaa; }
+.input-wrap input:focus, .input-wrap select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgb(22 124 90 / 11%); }
+.input-wrap input:disabled, .input-wrap select:disabled {
+  cursor: not-allowed;
+  color: #74807c;
+  border-color: var(--line);
+  background: #eef2f0;
+  box-shadow: none;
+  opacity: 1;
+}
 .input-wrap.has-suffix input { padding-right: 58px; }
 .input-suffix {
   position: absolute;
@@ -230,6 +251,8 @@ legend, .group-title {
   font-weight: 750;
 }
 .checkbox-label input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--green); }
+.checkbox-label input:disabled { cursor: not-allowed; filter: grayscale(1); opacity: .6; }
+.configuration-locked .field-label, .configuration-locked .checkbox-label { color: #74807c; }
 .checkbox-field .field-help { margin-left: 25px; }
 
 .form-error {
