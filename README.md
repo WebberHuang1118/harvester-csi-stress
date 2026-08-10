@@ -9,7 +9,7 @@ It can be run from the command line or through a local browser interface at
 For every worker and iteration, the test:
 
 1. Imports a Harvester `VirtualMachineImage`.
-2. Creates a VM with a block-mode boot disk and a filesystem-mode data disk.
+2. Creates a minimal KubeVirt VM with configurable boot and data PVCs.
 3. Writes random data to both disks and records their SHA-256 checksums.
 4. Creates a `VirtualMachineBackup` snapshot.
 5. Restores the snapshot as a new VM.
@@ -64,22 +64,14 @@ Run the script from a workstation that has:
 - `ssh-keygen`
 - Access to a Harvester cluster with the required Harvester, KubeVirt, CDI, and
   VolumeSnapshot APIs
-- An image storage class that supports block-mode boot disks
-- A data storage class that supports filesystem-mode PVCs and snapshots
+- An image storage class that supports the selected boot PVC mode
+- A data storage class that supports the selected data PVC mode and snapshots
 
-The reference VM manifest must contain:
-
-- An image-backed or block-mode boot PVC template
-- A separate filesystem-mode PVC template
-- A `cloudInitNoCloud` volume
-- A run strategy that automatically starts the VM
-
-The included [`scripts/vm-reference.yaml`](scripts/vm-reference.yaml) is an
-example exported from a cluster. Before using it, update cluster-specific values
-such as its Multus network, node affinity, disk capacities, and any other VM
-settings required by your environment. The script replaces VM identity fields,
-cloud-init configuration, CPU, memory, generated PVC names, image reference,
-and the two selected storage classes.
+An external VM template is not required. The script generates a minimal KubeVirt VM
+with `amd64` architecture, a `q35` machine, `virtio` disks and networking,
+`RerunOnFailure`, ACPI, and inline cloud-init data. PVC capacities, volume modes,
+access modes, Multus networking, guest interface, and node affinity are configured
+with command-line parameters.
 
 ## Run the stress test
 
@@ -90,8 +82,8 @@ repository root:
 # Update these values for your environment.
 export KUBECONFIG="/absolute/path/to/harvester-kubeconfig.yaml"
 IMAGE_URL="https://example.com/path/to/cloud-image.qcow2"
-IMAGE_STORAGE_CLASS="your-block-storage-class"
-DATA_STORAGE_CLASS="your-filesystem-storage-class"
+IMAGE_STORAGE_CLASS="your-image-storage-class"
+DATA_STORAGE_CLASS="your-data-storage-class"
 NAMESPACE="default"
 
 ./scripts/harvester-csi-stress-test \
@@ -100,7 +92,15 @@ NAMESPACE="default"
   --data-storage-class "$DATA_STORAGE_CLASS" \
   --cpu 2 \
   --memory 4Gi \
-  --vm-manifest ./scripts/vm-reference.yaml \
+  --boot-size-gib 50 \
+  --data-volume-size-gib 100 \
+  --boot-volume-mode Block \
+  --data-volume-mode Filesystem \
+  --boot-access-mode ReadWriteOnce \
+  --data-access-mode ReadWriteOnce \
+  --network-name default/mgmt-vlan \
+  --guest-interface-name enp1s0 \
+  --node-selector network.harvesterhci.io/mgmt=true \
   --iterations 3 \
   --parallel 2 \
   --namespace "$NAMESPACE"
@@ -108,8 +108,10 @@ NAMESPACE="default"
 
 This example runs two workers concurrently, with three iterations per worker,
 for six snapshot and restore cycles in total. Each iteration writes 1 GiB to the
-root disk and 10 GiB to the data disk by default. Make sure the reference VM's
-PVC capacities have enough free space.
+root disk and 10 GiB to the data disk by default. `--boot-size-gib` and
+`--data-volume-size-gib` control PVC capacities; `--root-data-size-gib` and
+`--data-size-gib` control how much random payload is written. Leave enough space
+for the guest operating system and filesystem metadata.
 
 `KUBECONFIG` selection uses this precedence:
 
@@ -127,7 +129,6 @@ For example, to override the environment for one invocation:
   --data-storage-class "$DATA_STORAGE_CLASS" \
   --cpu 2 \
   --memory 4Gi \
-  --vm-manifest ./scripts/vm-reference.yaml \
   --iterations 1
 ```
 
@@ -168,7 +169,9 @@ generated name prefixes. Review its listed resources carefully and prefer
 - The default guest data device is `/dev/vdb` and the mount point is
   `/mnt/csi-stress`.
 - The injected cloud-init configuration expects an Ubuntu-style guest with
-  passwordless `sudo`, DHCP on `enp1s0`, and package access to install
-  `qemu-guest-agent`.
+  passwordless `sudo` and package access to install `qemu-guest-agent`. DHCP is
+  configured on the interface selected by `--guest-interface-name`.
+- The default node selector is `network.harvesterhci.io/mgmt=true`. Pass
+  `--node-selector ''` to disable required node affinity.
 - The script creates and deletes Kubernetes resources. Use a dedicated namespace
   for safer testing when possible.

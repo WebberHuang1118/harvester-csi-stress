@@ -7,6 +7,9 @@ const state = {
   mode: "stress",
   currentJobId: "",
   currentJob: null,
+  activeJobId: "",
+  restoredJobId: "",
+  submitting: false,
   lastSequence: 0,
   activeFilter: "all",
   pollTimer: null,
@@ -16,6 +19,7 @@ const elements = {
   form: document.querySelector("#configForm"),
   modeGrid: document.querySelector("#modeGrid"),
   parameterGroups: document.querySelector("#parameterGroups"),
+  configTitle: document.querySelector("#configTitle"),
   formError: document.querySelector("#formError"),
   startButton: document.querySelector("#startButton"),
   stopButton: document.querySelector("#stopButton"),
@@ -79,6 +83,145 @@ function resetValues() {
   state.values = Object.fromEntries(state.parameters.map((parameter) => [parameter.key, parameter.default]));
 }
 
+function activeStatus(status) {
+  return ["starting", "running", "stopping"].includes(status);
+}
+
+function splitShellCommand(command) {
+  const tokens = [];
+  let token = "";
+  let quote = "";
+  let tokenStarted = false;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (quote) {
+      if (character === quote) {
+        quote = "";
+      } else if (character === "\\" && quote === '"' && index + 1 < command.length) {
+        index += 1;
+        token += command[index];
+      } else {
+        token += character;
+      }
+      tokenStarted = true;
+      continue;
+    }
+
+    if (/\s/.test(character)) {
+      if (tokenStarted) {
+        tokens.push(token);
+        token = "";
+        tokenStarted = false;
+      }
+    } else if (character === "'" || character === '"') {
+      quote = character;
+      tokenStarted = true;
+    } else if (character === "\\" && index + 1 < command.length) {
+      index += 1;
+      token += command[index];
+      tokenStarted = true;
+    } else {
+      token += character;
+      tokenStarted = true;
+    }
+  }
+  if (tokenStarted) tokens.push(token);
+  return tokens;
+}
+
+function configurationFromCommand(job) {
+  if (typeof job.command !== "string" || !job.command.trim()) return null;
+
+  const parametersByFlag = new Map();
+  for (const parameter of state.parameters) {
+    const flag = parameter.key === "cleanup_run_id"
+      ? "--cleanup-run"
+      : `--${parameter.key.replaceAll("_", "-")}`;
+    parametersByFlag.set(flag, parameter);
+  }
+
+  const config = { mode: job.mode };
+  const tokens = splitShellCommand(job.command);
+  let matched = false;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token.startsWith("KUBECONFIG=")) {
+      config.kubeconfig = token.slice("KUBECONFIG=".length);
+      matched = true;
+      continue;
+    }
+    if (token === "--cleanup-all") {
+      config.mode = "cleanup_all";
+      matched = true;
+      continue;
+    }
+
+    const separator = token.indexOf("=");
+    const flag = separator > 0 ? token.slice(0, separator) : token;
+    const parameter = parametersByFlag.get(flag);
+    if (!parameter) continue;
+
+    if (parameter.key === "cleanup_run_id") config.mode = "cleanup_run";
+    if (parameter.type === "checkbox") {
+      config[parameter.key] = true;
+      matched = true;
+      continue;
+    }
+
+    let value;
+    if (separator > 0) {
+      value = token.slice(separator + 1);
+    } else if (index + 1 < tokens.length) {
+      index += 1;
+      value = tokens[index];
+    } else {
+      continue;
+    }
+    config[parameter.key] = parameter.type === "number" && value !== "" ? Number(value) : value;
+    matched = true;
+  }
+  return matched ? config : null;
+}
+
+function updateConfigurationLock() {
+  const locked = state.submitting || Boolean(state.activeJobId);
+  for (const control of elements.modeGrid.querySelectorAll("input")) control.disabled = locked;
+  for (const control of elements.parameterGroups.querySelectorAll("input, select")) control.disabled = locked;
+  elements.resetButton.disabled = locked;
+  elements.startButton.disabled = locked;
+  elements.configTitle.textContent = locked ? "Current operation" : "New operation";
+  elements.form.classList.toggle("configuration-locked", locked);
+  elements.form.setAttribute("aria-busy", String(locked));
+}
+
+function restoreJobConfiguration(job) {
+  if (state.restoredJobId === job.id) return;
+  const config = job.config || configurationFromCommand(job);
+  if (!config) return;
+  state.mode = config.mode || job.mode;
+  for (const parameter of state.parameters) {
+    if (Object.prototype.hasOwnProperty.call(config, parameter.key)) {
+      state.values[parameter.key] = config[parameter.key];
+    }
+  }
+  state.restoredJobId = job.id;
+  renderModes();
+  renderParameters();
+  updateStartLabel();
+}
+
+function syncActiveJob(job = null) {
+  if (job && activeStatus(job.status)) {
+    state.activeJobId = job.id;
+    restoreJobConfiguration(job);
+  } else {
+    state.activeJobId = "";
+    state.restoredJobId = "";
+  }
+  updateConfigurationLock();
+}
+
 function renderModes() {
   elements.modeGrid.replaceChildren();
   for (const mode of state.modes) {
@@ -91,6 +234,7 @@ function renderModes() {
     input.id = `mode-${mode.value}`;
     input.value = mode.value;
     input.checked = mode.value === state.mode;
+    input.disabled = state.submitting || Boolean(state.activeJobId);
     input.addEventListener("change", () => {
       state.mode = mode.value;
       showFormError();
@@ -114,7 +258,7 @@ function renderModes() {
 }
 
 function isWideField(parameter) {
-  return ["kubeconfig", "image_url", "vm_manifest", "ssh_identity_file", "cleanup_run_id"].includes(parameter.key);
+  return ["kubeconfig", "image_url", "network_name", "node_selector", "ssh_identity_file", "cleanup_run_id"].includes(parameter.key);
 }
 
 function createField(parameter) {
@@ -129,6 +273,7 @@ function createField(parameter) {
     input.type = "checkbox";
     input.name = parameter.key;
     input.checked = Boolean(state.values[parameter.key]);
+    input.disabled = state.submitting || Boolean(state.activeJobId);
     input.addEventListener("change", () => { state.values[parameter.key] = input.checked; });
     const text = document.createElement("span");
     text.textContent = parameter.label;
@@ -151,11 +296,18 @@ function createField(parameter) {
 
   const inputWrap = document.createElement("div");
   inputWrap.className = `input-wrap${parameter.suffix ? " has-suffix" : ""}`;
-  const input = document.createElement("input");
+  const input = document.createElement(parameter.type === "select" ? "select" : "input");
   input.id = `parameter-${parameter.key}`;
   input.name = parameter.key;
-  input.type = parameter.type;
+  if (parameter.type === "select") {
+    for (const optionValue of parameter.options) {
+      input.add(new Option(optionValue, optionValue));
+    }
+  } else {
+    input.type = parameter.type;
+  }
   input.value = state.values[parameter.key];
+  input.disabled = state.submitting || Boolean(state.activeJobId);
   input.required = Boolean(parameter.required);
   if (parameter.min !== undefined) input.min = String(parameter.min);
   if (parameter.type === "number") input.step = "1";
@@ -245,8 +397,9 @@ function renderJob(job) {
 
   const active = ["starting", "running", "stopping"].includes(job.status);
   elements.stopButton.disabled = !active;
-  elements.startButton.disabled = active;
   elements.copyLogsButton.disabled = false;
+  if (job.id === state.activeJobId && !active) syncActiveJob();
+  updateConfigurationLock();
 
   if (job.total_iterations > 0) {
     const completed = Math.min(job.completed_iterations, job.total_iterations);
@@ -277,10 +430,10 @@ function resetJobView() {
   elements.runSummary.hidden = true;
   elements.commandPanel.hidden = true;
   elements.stopButton.disabled = true;
-  elements.startButton.disabled = false;
   elements.copyLogsButton.disabled = true;
   elements.logList.replaceChildren();
   elements.emptyOutput.hidden = false;
+  updateConfigurationLock();
 }
 
 function appendLogs(logs) {
@@ -331,9 +484,11 @@ async function refreshCurrentJob() {
     renderJob(body.job);
     appendLogs(body.logs);
     if (terminalStatus(body.job.status)) {
-      window.clearInterval(state.pollTimer);
-      state.pollTimer = null;
       await refreshHistory(false);
+      if (!state.activeJobId) {
+        window.clearInterval(state.pollTimer);
+        state.pollTimer = null;
+      }
     }
   } catch (error) {
     if (error.status === 404) {
@@ -346,9 +501,36 @@ async function refreshCurrentJob() {
   }
 }
 
+async function refreshActiveJob() {
+  if (!state.activeJobId || state.activeJobId === state.currentJobId) return;
+  try {
+    const body = await api(`/api/jobs/${state.activeJobId}`);
+    if (activeStatus(body.job.status)) {
+      syncActiveJob(body.job);
+    } else {
+      await refreshHistory(false);
+    }
+  } catch (error) {
+    if (error.status === 404) {
+      await refreshHistory(false);
+      return;
+    }
+    showToast(error.message);
+  }
+}
+
+async function pollInterface() {
+  await refreshCurrentJob();
+  await refreshActiveJob();
+  if (!state.activeJobId && state.currentJob && terminalStatus(state.currentJob.status)) {
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
 function startPolling() {
   window.clearInterval(state.pollTimer);
-  state.pollTimer = window.setInterval(refreshCurrentJob, 1000);
+  state.pollTimer = window.setInterval(pollInterface, 1000);
 }
 
 async function selectJob(jobId) {
@@ -359,12 +541,14 @@ async function selectJob(jobId) {
   elements.emptyOutput.hidden = false;
   elements.jobHistory.value = jobId;
   await refreshCurrentJob();
-  startPolling();
+  if (state.activeJobId || (state.currentJob && !terminalStatus(state.currentJob.status))) startPolling();
 }
 
 async function refreshHistory(selectNewest = false) {
   const body = await api("/api/jobs");
   const previous = state.currentJobId;
+  const activeJob = body.jobs.find((job) => activeStatus(job.status)) || null;
+  syncActiveJob(activeJob);
   elements.jobHistory.replaceChildren();
   if (!body.jobs.length) {
     const option = new Option("No runs yet", "");
@@ -376,7 +560,7 @@ async function refreshHistory(selectNewest = false) {
     elements.jobHistory.add(new Option(label, job.id));
   }
   if (selectNewest || !previous) {
-    await selectJob(body.jobs[0].id);
+    await selectJob(activeJob ? activeJob.id : body.jobs[0].id);
   } else if (body.jobs.some((job) => job.id === previous)) {
     elements.jobHistory.value = previous;
   }
@@ -394,7 +578,8 @@ async function submitOperation(event) {
     payload.confirm_cleanup = true;
   }
 
-  elements.startButton.disabled = true;
+  state.submitting = true;
+  updateConfigurationLock();
   try {
     const body = await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
     await refreshHistory(false);
@@ -402,7 +587,9 @@ async function submitOperation(event) {
     showToast("Operation started");
   } catch (error) {
     showFormError(error.message);
-    elements.startButton.disabled = false;
+  } finally {
+    state.submitting = false;
+    updateConfigurationLock();
   }
 }
 
@@ -489,6 +676,7 @@ elements.stopButton.addEventListener("click", stopCurrentJob);
 elements.copyCommandButton.addEventListener("click", copyCommand);
 elements.copyLogsButton.addEventListener("click", copyAllOutput);
 elements.resetButton.addEventListener("click", () => {
+  if (state.activeJobId || state.submitting) return;
   state.mode = "stress";
   resetValues();
   renderModes();

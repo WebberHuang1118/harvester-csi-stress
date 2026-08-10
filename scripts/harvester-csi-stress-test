@@ -8,6 +8,9 @@ readonly IMAGE_ID_ANNOTATION="harvesterhci.io/imageId"
 readonly STRESS_RUN_LABEL="csi.harvesterhci.io/stress-run"
 readonly STRESS_ITERATION_LABEL="csi.harvesterhci.io/stress-iteration"
 readonly CLOUD_INIT_PASSWORD="password1234"
+readonly BOOT_TEMPLATE_INDEX=0
+readonly DATA_TEMPLATE_INDEX=1
+readonly DATA_VOLUME_NAME="data-disk"
 
 NAMESPACE="default"
 KUBECONFIG_PATH="${KUBECONFIG:-}"
@@ -17,7 +20,17 @@ IMAGE_STORAGE_CLASS=""
 DATA_STORAGE_CLASS=""
 CPU=""
 MEMORY=""
-REFERENCE_VM_MANIFEST=""
+BOOT_SIZE_GIB=50
+DATA_VOLUME_SIZE_GIB=100
+BOOT_VOLUME_MODE="Block"
+DATA_VOLUME_MODE="Filesystem"
+BOOT_ACCESS_MODE="ReadWriteOnce"
+DATA_ACCESS_MODE="ReadWriteOnce"
+NETWORK_NAME="default/mgmt-vlan"
+GUEST_INTERFACE_NAME="enp1s0"
+NODE_SELECTOR="network.harvesterhci.io/mgmt=true"
+NODE_SELECTOR_KEY=""
+NODE_SELECTOR_VALUE=""
 ITERATIONS=""
 PARALLEL=1
 SSH_USER="ubuntu"
@@ -57,7 +70,6 @@ Usage:
     --data-storage-class NAME \\
     --cpu COUNT \\
     --memory QUANTITY \\
-    --vm-manifest PATH \\
     --iterations COUNT [options]
 
 Cleanup:
@@ -67,18 +79,31 @@ Cleanup:
 Required arguments:
   --image-url URL          Source URL for the Harvester VirtualMachineImage.
   --image-storage-class NAME
-                           StorageClass for the VM image and Block-mode boot disk.
+                           StorageClass for the VM image and boot PVCs.
   --data-storage-class NAME
-                           StorageClass for the Filesystem-mode data PVC.
+                           StorageClass for the data PVC.
   --cpu COUNT              Positive integer vCPU count for each test VM.
   --memory QUANTITY        Kubernetes memory quantity, for example 4Gi.
-  --vm-manifest PATH       Existing kubevirt.io/v1 VirtualMachine manifest used as a template.
   --iterations COUNT       Snapshot/restore iterations run by each worker.
 
 Options:
   --namespace NAME         Namespace for all namespaced resources (default: default).
   --kubeconfig PATH        Kubeconfig file to use. Defaults to the KUBECONFIG
                            environment variable, then Kubernetes' standard lookup.
+  --boot-size-gib COUNT    Boot PVC capacity in GiB (default: 50).
+  --data-volume-size-gib COUNT
+                           Data PVC capacity in GiB (default: 100).
+  --boot-volume-mode MODE  Boot PVC mode: Block or Filesystem (default: Block).
+  --data-volume-mode MODE  Data PVC mode: Block or Filesystem (default: Filesystem).
+  --boot-access-mode MODE  Boot PVC access mode (default: ReadWriteOnce).
+  --data-access-mode MODE  Data PVC access mode (default: ReadWriteOnce).
+  --network-name NAME      Multus NetworkAttachmentDefinition as [namespace/]name
+                           (default: default/mgmt-vlan).
+  --guest-interface-name NAME
+                           Linux interface configured by cloud-init (default: enp1s0).
+  --node-selector KEY=VALUE
+                           Required VM node selector. Pass an empty value to disable
+                           (default: network.harvesterhci.io/mgmt=true).
   --parallel COUNT         Number of concurrent VM workflow workers (default: 1).
   --data-size-gib COUNT    Random payload size in GiB (default: 10).
   --root-data-size-gib COUNT
@@ -95,19 +120,13 @@ Options:
   --cleanup-run RUN_ID     List and delete resources from one stress run.
   -h, --help               Show this help.
 
-The reference VM must have:
-  * an image-backed PVC template for its boot disk; and
-  * a separate Filesystem-mode PVC disk with enough free capacity for the payload.
-
-The script creates the VMImage once. Each iteration inherits PVC capacities from
-the reference VM, while overriding the boot/data StorageClasses and volume modes.
-For example, --iterations 10 --parallel 3 starts three concurrent workers. Each
+The script creates a minimal KubeVirt VM manifest and VMImage for each run. For
+example, --iterations 10 --parallel 3 starts three concurrent workers. Each
 worker runs ten VM, snapshot, restore, and integrity-check cycles (30 total).
 Parallel execution requires Bash 5.1 or newer.
 
-The reference VM must have a cloudInitNoCloud volume. The script replaces its
-configuration with Ubuntu password/key access, DHCP on enp1s0, and installation
-of qemu-guest-agent. It uses virtctl ssh and requires passwordless sudo, as
+Cloud-init configures DHCP on --guest-interface-name and installs
+qemu-guest-agent. The script uses virtctl ssh and requires passwordless sudo, as
 provided by the default ubuntu cloud-image user.
 EOF
 }
@@ -125,6 +144,18 @@ require_positive_integer() {
 	local name="$1"
 	local value="$2"
 	[[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "${name} must be a positive integer, got ${value@Q}"
+}
+
+require_enum() {
+	local name="$1"
+	local value="$2"
+	shift 2
+	local candidate=""
+
+	for candidate in "$@"; do
+		[[ "$value" == "$candidate" ]] && return 0
+	done
+	fail "invalid ${name} value: ${value@Q}"
 }
 
 resource_name() {
@@ -158,8 +189,40 @@ while (($# > 0)); do
 		MEMORY="${2:-}"
 		shift 2
 		;;
-	--vm-manifest)
-		REFERENCE_VM_MANIFEST="${2:-}"
+	--boot-size-gib)
+		BOOT_SIZE_GIB="${2:-}"
+		shift 2
+		;;
+	--data-volume-size-gib)
+		DATA_VOLUME_SIZE_GIB="${2:-}"
+		shift 2
+		;;
+	--boot-volume-mode)
+		BOOT_VOLUME_MODE="${2:-}"
+		shift 2
+		;;
+	--data-volume-mode)
+		DATA_VOLUME_MODE="${2:-}"
+		shift 2
+		;;
+	--boot-access-mode)
+		BOOT_ACCESS_MODE="${2:-}"
+		shift 2
+		;;
+	--data-access-mode)
+		DATA_ACCESS_MODE="${2:-}"
+		shift 2
+		;;
+	--network-name)
+		NETWORK_NAME="${2:-}"
+		shift 2
+		;;
+	--guest-interface-name)
+		GUEST_INTERFACE_NAME="${2:-}"
+		shift 2
+		;;
+	--node-selector)
+		NODE_SELECTOR="${2:-}"
 		shift 2
 		;;
 	--iterations)
@@ -266,9 +329,7 @@ else
 	[[ -n "$DATA_STORAGE_CLASS" ]] || fail "--data-storage-class is required"
 	[[ -n "$CPU" ]] || fail "--cpu is required"
 	[[ -n "$MEMORY" ]] || fail "--memory is required"
-	[[ -n "$REFERENCE_VM_MANIFEST" ]] || fail "--vm-manifest is required"
 	[[ -n "$ITERATIONS" ]] || fail "--iterations is required"
-	[[ -f "$REFERENCE_VM_MANIFEST" ]] || fail "VM manifest not found: ${REFERENCE_VM_MANIFEST}"
 	if [[ -n "$SSH_IDENTITY_FILE" ]]; then
 		[[ -f "$SSH_IDENTITY_FILE" ]] || fail "SSH identity file not found: ${SSH_IDENTITY_FILE}"
 	fi
@@ -276,19 +337,39 @@ else
 	[[ "$GUEST_DEVICE" =~ ^/dev/[a-zA-Z0-9._/-]+$ ]] || fail "invalid --guest-device: ${GUEST_DEVICE@Q}"
 	[[ "$GUEST_MOUNT_PATH" =~ ^/mnt/[a-zA-Z0-9._/-]+$ ]] ||
 		fail "--guest-mount-path must be a path below /mnt, got ${GUEST_MOUNT_PATH@Q}"
+	[[ "$GUEST_INTERFACE_NAME" =~ ^[a-zA-Z0-9_.-]+$ ]] ||
+		fail "invalid --guest-interface-name: ${GUEST_INTERFACE_NAME@Q}"
+	[[ "$NETWORK_NAME" =~ ^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] ||
+		fail "invalid --network-name: ${NETWORK_NAME@Q}"
+	require_enum "--boot-volume-mode" "$BOOT_VOLUME_MODE" Block Filesystem
+	require_enum "--data-volume-mode" "$DATA_VOLUME_MODE" Block Filesystem
+	require_enum "--boot-access-mode" "$BOOT_ACCESS_MODE" ReadWriteOnce ReadWriteMany ReadOnlyMany ReadWriteOncePod
+	require_enum "--data-access-mode" "$DATA_ACCESS_MODE" ReadWriteOnce ReadWriteMany ReadOnlyMany ReadWriteOncePod
+	if [[ -n "$NODE_SELECTOR" ]]; then
+		[[ "$NODE_SELECTOR" == *=* ]] || fail "--node-selector must use KEY=VALUE syntax"
+		NODE_SELECTOR_KEY="${NODE_SELECTOR%%=*}"
+		NODE_SELECTOR_VALUE="${NODE_SELECTOR#*=}"
+		[[ -n "$NODE_SELECTOR_KEY" && -n "$NODE_SELECTOR_VALUE" ]] ||
+			fail "--node-selector requires a non-empty key and value"
+	fi
 
 	require_positive_integer "--cpu" "$CPU"
 	require_positive_integer "--iterations" "$ITERATIONS"
 	require_positive_integer "--parallel" "$PARALLEL"
+	require_positive_integer "--boot-size-gib" "$BOOT_SIZE_GIB"
+	require_positive_integer "--data-volume-size-gib" "$DATA_VOLUME_SIZE_GIB"
 	require_positive_integer "--data-size-gib" "$DATA_SIZE_GIB"
 	require_positive_integer "--root-data-size-gib" "$ROOT_DATA_SIZE_GIB"
 	require_positive_integer "--timeout" "$TIMEOUT_SECONDS"
 	require_positive_integer "--poll-interval" "$POLL_INTERVAL_SECONDS"
+	((ROOT_DATA_SIZE_GIB < BOOT_SIZE_GIB)) ||
+		fail "--root-data-size-gib must be smaller than --boot-size-gib"
+	((DATA_SIZE_GIB < DATA_VOLUME_SIZE_GIB)) ||
+		fail "--data-size-gib must be smaller than --data-volume-size-gib"
 
 	RUN_ID="$(resource_name "csi-stress-$(date -u +%Y%m%d%H%M%S)-${RANDOM}")"
 	IMAGE_NAME="$(resource_name "${RUN_ID}-image")"
 	STRESS_TMP_DIR="$(mktemp -d)"
-	REFERENCE_VM_JSON="${STRESS_TMP_DIR}/reference-vm.json"
 
 	if [[ -z "$SSH_IDENTITY_FILE" ]]; then
 		SSH_IDENTITY_FILE="${STRESS_TMP_DIR}/id_ed25519"
@@ -313,7 +394,7 @@ else
 	CLOUD_INIT_NETWORK_DATA="$(printf '%s\n' \
 		'network:' \
 		'  ethernets:' \
-		'    enp1s0:' \
+		"    ${GUEST_INTERFACE_NAME}:" \
 		'      dhcp4: true' \
 		'      dhcp6: true' \
 		'      dhcp-identifier: mac' \
@@ -906,53 +987,20 @@ trap 'exit 143' TERM
 kubectl get namespace "$NAMESPACE" >/dev/null
 kubectl get storageclass "$IMAGE_STORAGE_CLASS" >/dev/null
 kubectl get storageclass "$DATA_STORAGE_CLASS" >/dev/null
-kubectl create --dry-run=client -f "$REFERENCE_VM_MANIFEST" -o json >"$REFERENCE_VM_JSON"
 
-jq -e '.apiVersion == "kubevirt.io/v1" and .kind == "VirtualMachine"' "$REFERENCE_VM_JSON" >/dev/null ||
-	fail "--vm-manifest must contain one kubevirt.io/v1 VirtualMachine"
-jq -e --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" '
-  ((.metadata.annotations[$annotation] // "[]" | fromjson) | type == "array" and length > 0)
-' "$REFERENCE_VM_JSON" >/dev/null || fail "reference VM has no valid ${VOLUME_TEMPLATE_ANNOTATION} annotation"
-jq -e 'any(.spec.template.spec.volumes[]?; .cloudInitNoCloud? != null)' "$REFERENCE_VM_JSON" >/dev/null ||
-	fail "reference VM requires a cloudInitNoCloud volume"
-
-BOOT_TEMPLATE_INDEX="$(jq -r --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" --arg imageID "$IMAGE_ID_ANNOTATION" '
-  (.metadata.annotations[$annotation] | fromjson) as $templates
-  | (
-      [$templates | to_entries[] | select(.value.metadata.annotations[$imageID]? != null)][0].key //
-      [$templates | to_entries[] | select((.value.spec.volumeMode // "Filesystem") == "Block")][0].key //
-      empty
-    )
-' "$REFERENCE_VM_JSON")"
-[[ -n "$BOOT_TEMPLATE_INDEX" ]] || fail "could not identify an image-backed or Block-mode boot PVC template"
-
-DATA_TEMPLATE_INDEX="$(jq -r --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" --argjson boot "$BOOT_TEMPLATE_INDEX" '
-  (.metadata.annotations[$annotation] | fromjson) as $templates
-  | [$templates | to_entries[] | select(.key != $boot and (.value.spec.volumeMode // "Filesystem") == "Filesystem")][0].key // empty
-' "$REFERENCE_VM_JSON")"
-[[ -n "$DATA_TEMPLATE_INDEX" ]] || fail "reference VM requires a non-boot Filesystem-mode PVC template"
-
-DATA_ORIGINAL_PVC="$(jq -r --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" --argjson index "$DATA_TEMPLATE_INDEX" '
-  (.metadata.annotations[$annotation] | fromjson)[$index].metadata.name // empty
-' "$REFERENCE_VM_JSON")"
-[[ -n "$DATA_ORIGINAL_PVC" ]] || fail "filesystem PVC template has no metadata.name"
-
-DATA_VOLUME_NAME="$(jq -r --arg claim "$DATA_ORIGINAL_PVC" '
-  [.spec.template.spec.volumes[]? | select(.persistentVolumeClaim.claimName? == $claim)][0].name // empty
-' "$REFERENCE_VM_JSON")"
-[[ -n "$DATA_VOLUME_NAME" ]] || fail "could not map filesystem PVC ${DATA_ORIGINAL_PVC} to a VM volume"
-
-REFERENCE_RUN_STRATEGY="$(jq -r '.spec.runStrategy // empty' "$REFERENCE_VM_JSON")"
-[[ -n "$REFERENCE_RUN_STRATEGY" ]] || fail "reference VM must define spec.runStrategy"
-case "$REFERENCE_RUN_STRATEGY" in
-Halted | Manual)
-	fail "reference VM runStrategy ${REFERENCE_RUN_STRATEGY} does not automatically start a VMI"
-	;;
-esac
+NETWORK_NAMESPACE="$NAMESPACE"
+NETWORK_RESOURCE_NAME="$NETWORK_NAME"
+if [[ "$NETWORK_NAME" == */* ]]; then
+	NETWORK_NAMESPACE="${NETWORK_NAME%%/*}"
+	NETWORK_RESOURCE_NAME="${NETWORK_NAME#*/}"
+fi
+kubectl get network-attachment-definitions.k8s.cni.cncf.io "$NETWORK_RESOURCE_NAME" \
+	-n "$NETWORK_NAMESPACE" >/dev/null
 
 log "Run ID: ${RUN_ID}"
-log "Reference boot PVC template index: ${BOOT_TEMPLATE_INDEX}"
-log "Filesystem data volume: ${DATA_VOLUME_NAME} (template index ${DATA_TEMPLATE_INDEX})"
+log "Boot PVC: ${BOOT_SIZE_GIB}Gi ${BOOT_VOLUME_MODE} ${BOOT_ACCESS_MODE} on ${IMAGE_STORAGE_CLASS}"
+log "Data PVC: ${DATA_VOLUME_SIZE_GIB}Gi ${DATA_VOLUME_MODE} ${DATA_ACCESS_MODE} on ${DATA_STORAGE_CLASS}"
+log "VM network: ${NETWORK_NAME}; guest interface: ${GUEST_INTERFACE_NAME}"
 
 log "Creating VirtualMachineImage ${NAMESPACE}/${IMAGE_NAME}"
 jq -n \
@@ -1000,7 +1048,7 @@ create_iteration_vm() {
 	local vm_json="$2"
 	local image_id="${NAMESPACE}/${IMAGE_NAME}"
 
-	jq \
+	jq -n \
 		--arg namespace "$NAMESPACE" \
 		--arg vm "$CURRENT_VM" \
 		--arg run "$RUN_ID" \
@@ -1010,111 +1058,143 @@ create_iteration_vm() {
 		--arg templateAnnotation "$VOLUME_TEMPLATE_ANNOTATION" \
 		--arg imageAnnotation "$IMAGE_ID_ANNOTATION" \
 		--arg imageID "$image_id" \
-		--arg imageStorageClass "$IMAGE_STORAGE_CLASS" \
+		--arg bootStorageClass "$IMAGE_STORAGE_CLASS" \
 		--arg dataStorageClass "$DATA_STORAGE_CLASS" \
+		--arg bootSize "${BOOT_SIZE_GIB}Gi" \
+		--arg dataSize "${DATA_VOLUME_SIZE_GIB}Gi" \
+		--arg bootVolumeMode "$BOOT_VOLUME_MODE" \
+		--arg dataVolumeMode "$DATA_VOLUME_MODE" \
+		--arg bootAccessMode "$BOOT_ACCESS_MODE" \
+		--arg dataAccessMode "$DATA_ACCESS_MODE" \
+		--arg networkName "$NETWORK_NAME" \
+		--arg nodeSelectorKey "$NODE_SELECTOR_KEY" \
+		--arg nodeSelectorValue "$NODE_SELECTOR_VALUE" \
 		--arg cloudInitUserData "$CLOUD_INIT_USER_DATA" \
 		--arg cloudInitNetworkData "$CLOUD_INIT_NETWORK_DATA" \
 		--arg memory "$MEMORY" \
-		--argjson cpu "$CPU" \
-		--argjson bootIndex "$BOOT_TEMPLATE_INDEX" \
-		--argjson dataIndex "$DATA_TEMPLATE_INDEX" '
-    (.metadata.annotations[$templateAnnotation] | fromjson) as $originalTemplates
-    | (
-        $originalTemplates
-        | to_entries
-        | map(
-            .key as $index
-            | .value as $template
-            | {
-                oldName: $template.metadata.name,
-                value: (
-                  $template
-                  | .metadata.name = ($vm + "-pvc-" + ($index | tostring))
-                  | .metadata.labels = ((.metadata.labels // {}) + {
-                      ($runLabel): $run,
-                      ($iterationLabel): $iteration
-                  })
-                  | if $index == $bootIndex then
-                      .metadata.annotations = ((.metadata.annotations // {}) + {($imageAnnotation): $imageID})
-                      | .spec.storageClassName = $imageStorageClass
-                      | .spec.accessModes = ["ReadWriteOnce"]
-                      | .spec.volumeMode = "Block"
-                    elif $index == $dataIndex then
-                      .spec.storageClassName = $dataStorageClass
-                      | .spec.accessModes = ["ReadWriteOnce"]
-                      | .spec.volumeMode = "Filesystem"
-                    else . end
-                )
-              }
-          )
-      ) as $templateEntries
-    | ($templateEntries | map({key: .oldName, value: .value.metadata.name}) | from_entries) as $claimNames
-    | ($templateEntries | map(.value)) as $newTemplates
-    | del(
-        .status,
-        .metadata.creationTimestamp,
-        .metadata.deletionTimestamp,
-        .metadata.finalizers,
-        .metadata.generateName,
-        .metadata.generation,
-        .metadata.managedFields,
-        .metadata.ownerReferences,
-        .metadata.resourceVersion,
-        .metadata.selfLink,
-        .metadata.uid
-      )
-    | .metadata.name = $vm
-    | .metadata.namespace = $namespace
-    | .metadata.labels = ((.metadata.labels // {}) + {
-        ($runLabel): $run,
-        ($iterationLabel): $iteration
-      })
-    | .metadata.annotations = ((.metadata.annotations // {}) + {
-        ($templateAnnotation): ($newTemplates | tojson)
-      })
-    | del(
-        .metadata.annotations["harvesterhci.io/mac-address"],
-        .metadata.annotations["kubevirt.io/latest-observed-api-version"],
-        .metadata.annotations["kubevirt.io/storage-observed-api-version"]
-      )
-    | .spec.template.metadata.labels = ((.spec.template.metadata.labels // {}) + {
-        "harvesterhci.io/vmName": $vm,
-        ($runLabel): $run,
-        ($iterationLabel): $iteration
-      })
-    | .spec.template.spec.hostname = $vm
-    | .spec.template.spec.domain.cpu.cores = $cpu
-    | .spec.template.spec.domain.cpu.sockets = 1
-    | .spec.template.spec.domain.cpu.threads = 1
-    | .spec.template.spec.domain.cpu.maxSockets = 1
-    | .spec.template.spec.domain.resources.limits.cpu = ($cpu | tostring)
-    | .spec.template.spec.domain.resources.requests.cpu = ($cpu | tostring)
-    | .spec.template.spec.domain.memory.guest = $memory
-    | .spec.template.spec.domain.resources.limits.memory = $memory
-    | .spec.template.spec.domain.resources.requests.memory = $memory
-    | del(
-        .spec.template.spec.domain.firmware.serial,
-        .spec.template.spec.domain.firmware.uuid
-      )
-    | .spec.template.spec.domain.devices.interfaces |= map(del(.macAddress))
-    | .spec.template.spec.volumes |= map(
-        if .persistentVolumeClaim.claimName? != null then
-          .persistentVolumeClaim.claimName = $claimNames[.persistentVolumeClaim.claimName]
-        elif .cloudInitNoCloud? != null then
-          .cloudInitNoCloud = {
-            userData: $cloudInitUserData,
-            networkData: $cloudInitNetworkData
+		--argjson cpu "$CPU" '
+    ($vm + "-pvc-0") as $bootPVC
+    | ($vm + "-pvc-1") as $dataPVC
+    | [
+        {
+          metadata: {
+            name: $bootPVC,
+            annotations: {($imageAnnotation): $imageID},
+            labels: {($runLabel): $run, ($iterationLabel): $iteration}
+          },
+          spec: {
+            accessModes: [$bootAccessMode],
+            resources: {requests: {storage: $bootSize}},
+            volumeMode: $bootVolumeMode,
+            storageClassName: $bootStorageClass
           }
-        else . end
-      )
-  ' "$REFERENCE_VM_JSON" >"$vm_json"
+        },
+        {
+          metadata: {
+            name: $dataPVC,
+            labels: {($runLabel): $run, ($iterationLabel): $iteration}
+          },
+          spec: {
+            accessModes: [$dataAccessMode],
+            resources: {requests: {storage: $dataSize}},
+            volumeMode: $dataVolumeMode,
+            storageClassName: $dataStorageClass
+          }
+        }
+      ] as $volumeTemplates
+    | {
+        apiVersion: "kubevirt.io/v1",
+        kind: "VirtualMachine",
+        metadata: {
+          name: $vm,
+          namespace: $namespace,
+          annotations: {
+            ($templateAnnotation): ($volumeTemplates | tojson),
+            "harvesterhci.io/vmRunStrategy": "RerunOnFailure"
+          },
+          labels: {
+            ($runLabel): $run,
+            ($iterationLabel): $iteration,
+            "harvesterhci.io/creator": "harvester",
+            "harvesterhci.io/os": "ubuntu"
+          }
+        },
+        spec: {
+          runStrategy: "RerunOnFailure",
+          template: {
+            metadata: {
+              labels: {
+                "harvesterhci.io/vmName": $vm,
+                ($runLabel): $run,
+                ($iterationLabel): $iteration
+              }
+            },
+            spec: {
+              architecture: "amd64",
+              domain: {
+                cpu: {cores: $cpu, sockets: 1, threads: 1, maxSockets: 1},
+                devices: {
+                  disks: [
+                    {name: "boot-disk", bootOrder: 1, disk: {bus: "virtio"}},
+                    {name: "data-disk", bootOrder: 2, disk: {bus: "virtio"}},
+                    {name: "cloudinitdisk", disk: {bus: "virtio"}}
+                  ],
+                  interfaces: [
+                    {name: "default", model: "virtio", bridge: {}}
+                  ]
+                },
+                features: {acpi: {enabled: true}},
+                machine: {type: "q35"},
+                memory: {guest: $memory},
+                resources: {
+                  limits: {cpu: ($cpu | tostring), memory: $memory},
+                  requests: {cpu: ($cpu | tostring), memory: $memory}
+                }
+              },
+              hostname: $vm,
+              networks: [
+                {name: "default", multus: {networkName: $networkName}}
+              ],
+              terminationGracePeriodSeconds: 20,
+              volumes: [
+                {name: "boot-disk", persistentVolumeClaim: {claimName: $bootPVC}},
+                {name: "data-disk", persistentVolumeClaim: {claimName: $dataPVC}},
+                {
+                  name: "cloudinitdisk",
+                  cloudInitNoCloud: {
+                    userData: $cloudInitUserData,
+                    networkData: $cloudInitNetworkData
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    | if $nodeSelectorKey != "" then
+        .spec.template.spec.affinity = {
+          nodeAffinity: {
+            requiredDuringSchedulingIgnoredDuringExecution: {
+              nodeSelectorTerms: [
+                {
+                  matchExpressions: [
+                    {key: $nodeSelectorKey, operator: "In", values: [$nodeSelectorValue]}
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      else . end
+  ' >"$vm_json"
 
-	if jq -e '
-      .spec.template.spec.volumes[]?
-      | select(has("persistentVolumeClaim") and .persistentVolumeClaim.claimName == null)
-    ' "$vm_json" >/dev/null; then
-		fail "failed to map one or more PVC-backed VM volumes to generated claim names"
-	fi
+	jq -e --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" '
+      .apiVersion == "kubevirt.io/v1"
+      and .kind == "VirtualMachine"
+      and ((.metadata.annotations[$annotation] | fromjson) | length == 2)
+      and ([.spec.template.spec.volumes[] | select(.persistentVolumeClaim? != null)] | length == 2)
+      and ([.spec.template.spec.volumes[] | select(.cloudInitNoCloud? != null)] | length == 1)
+    ' "$vm_json" >/dev/null || fail "generated VM manifest failed internal validation"
 
 	kubectl apply -f "$vm_json" >/dev/null
 }
