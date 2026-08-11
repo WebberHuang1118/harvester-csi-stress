@@ -44,8 +44,12 @@ ROOT_PAYLOAD_DIRECTORY="/var/lib/csi-stress"
 DATA_SIZE_GIB=10
 ROOT_DATA_SIZE_GIB=1
 TIMEOUT_SECONDS=3600
+SSH_TIMEOUT_SECONDS=900
+SSH_VM_RETRIES=0
 POLL_INTERVAL_SECONDS=5
+SNAPSHOT_ERROR_GRACE_SECONDS=60
 KEEP_RESOURCES=false
+KEEP_FAILED_RESOURCES=false
 CLEANUP_MODE=false
 CLEANUP_RUN_ID=""
 
@@ -60,6 +64,12 @@ CURRENT_BOOT_PVC=""
 STRESS_TMP_DIR=""
 LOG_PREFIX=""
 ACTIVE_PIDS=()
+PARENT_SIGNALLED=false
+WORKER_SIGNALLED=false
+CURRENT_FAILURE_CATEGORY=""
+SSH_FAILURE_STAGE=""
+LAST_SSH_ERROR=""
+CURRENT_DIAGNOSTICS_COLLECTED=false
 
 usage() {
 	cat <<EOF
@@ -109,13 +119,23 @@ Options:
   --root-data-size-gib COUNT
                            Random root-disk payload size in GiB (default: 1).
   --timeout SECONDS        Timeout for each asynchronous operation (default: 3600).
+  --ssh-timeout SECONDS    Total timeout for guest SSH readiness and transient
+                           restored-checksum SSH retries (default: 900).
+  --ssh-vm-retries COUNT   Additional fresh iteration attempts after source or
+                           restored VM SSH readiness times out (default: 0).
   --poll-interval SECONDS  Status polling interval (default: 5).
+  --snapshot-error-grace SECONDS
+                           Continue waiting this long after a VM snapshot reports
+                           an error so controller retries can recover (default: 60;
+                           use 0 for fail-fast behavior).
   --ssh-user USER          Cloud image's default SSH user (default: ubuntu).
   --ssh-identity-file PATH Existing unencrypted private key to inject and use.
                            By default, the script generates an ephemeral key.
   --guest-device PATH      Guest data disk device (default: /dev/vdb).
   --guest-mount-path PATH  Guest mount point (default: /mnt/csi-stress).
   --keep-resources         Do not remove resources created by the script.
+  --keep-failed-resources  Retain only the failed iteration and shared image for
+                           diagnostics; successful iterations are still removed.
   --cleanup                List and delete resources from every old stress run.
   --cleanup-run RUN_ID     List and delete resources from one stress run.
   -h, --help               Show this help.
@@ -144,6 +164,12 @@ require_positive_integer() {
 	local name="$1"
 	local value="$2"
 	[[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "${name} must be a positive integer, got ${value@Q}"
+}
+
+require_non_negative_integer() {
+	local name="$1"
+	local value="$2"
+	[[ "$value" =~ ^[0-9]+$ ]] || fail "${name} must be a non-negative integer, got ${value@Q}"
 }
 
 require_enum() {
@@ -263,8 +289,20 @@ while (($# > 0)); do
 		TIMEOUT_SECONDS="${2:-}"
 		shift 2
 		;;
+	--ssh-timeout)
+		SSH_TIMEOUT_SECONDS="${2:-}"
+		shift 2
+		;;
+	--ssh-vm-retries)
+		SSH_VM_RETRIES="${2:-}"
+		shift 2
+		;;
 	--poll-interval)
 		POLL_INTERVAL_SECONDS="${2:-}"
+		shift 2
+		;;
+	--snapshot-error-grace)
+		SNAPSHOT_ERROR_GRACE_SECONDS="${2:-}"
 		shift 2
 		;;
 	--guest-device)
@@ -277,6 +315,10 @@ while (($# > 0)); do
 		;;
 	--keep-resources)
 		KEEP_RESOURCES=true
+		shift
+		;;
+	--keep-failed-resources)
+		KEEP_FAILED_RESOURCES=true
 		shift
 		;;
 	--cleanup)
@@ -311,6 +353,7 @@ if [[ "$CLEANUP_MODE" == true ]]; then
 		command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: ${required_command}"
 	done
 	[[ "$KEEP_RESOURCES" == false ]] || fail "--keep-resources cannot be used with cleanup mode"
+	[[ "$KEEP_FAILED_RESOURCES" == false ]] || fail "--keep-failed-resources cannot be used with cleanup mode"
 	if [[ -n "$CLEANUP_RUN_ID" ]]; then
 		[[ "$CLEANUP_RUN_ID" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] ||
 			fail "invalid --cleanup-run value: ${CLEANUP_RUN_ID@Q}"
@@ -330,6 +373,9 @@ else
 	[[ -n "$CPU" ]] || fail "--cpu is required"
 	[[ -n "$MEMORY" ]] || fail "--memory is required"
 	[[ -n "$ITERATIONS" ]] || fail "--iterations is required"
+	if [[ "$KEEP_RESOURCES" == true && "$KEEP_FAILED_RESOURCES" == true ]]; then
+		fail "--keep-resources and --keep-failed-resources cannot be used together"
+	fi
 	if [[ -n "$SSH_IDENTITY_FILE" ]]; then
 		[[ -f "$SSH_IDENTITY_FILE" ]] || fail "SSH identity file not found: ${SSH_IDENTITY_FILE}"
 	fi
@@ -361,7 +407,10 @@ else
 	require_positive_integer "--data-size-gib" "$DATA_SIZE_GIB"
 	require_positive_integer "--root-data-size-gib" "$ROOT_DATA_SIZE_GIB"
 	require_positive_integer "--timeout" "$TIMEOUT_SECONDS"
+	require_positive_integer "--ssh-timeout" "$SSH_TIMEOUT_SECONDS"
+	require_non_negative_integer "--ssh-vm-retries" "$SSH_VM_RETRIES"
 	require_positive_integer "--poll-interval" "$POLL_INTERVAL_SECONDS"
+	require_non_negative_integer "--snapshot-error-grace" "$SNAPSHOT_ERROR_GRACE_SECONDS"
 	((ROOT_DATA_SIZE_GIB < BOOT_SIZE_GIB)) ||
 		fail "--root-data-size-gib must be smaller than --boot-size-gib"
 	((DATA_SIZE_GIB < DATA_VOLUME_SIZE_GIB)) ||
@@ -407,20 +456,47 @@ wait_for_resource() {
 	local expression="$3"
 	local description="$4"
 	local failure_expression="${5:-false}"
+	local failure_grace_seconds="${6:-0}"
 	local deadline=$((SECONDS + TIMEOUT_SECONDS))
+	local failure_first_seen=-1
+	local failure_elapsed=0
+	local failure_message=""
 	local object=""
 
 	log "Waiting for ${description}: ${resource}/${name}"
 	while ((SECONDS < deadline)); do
 		if object="$(kubectl get "$resource" "$name" -n "$NAMESPACE" -o json 2>/dev/null)"; then
 			if jq -e "$expression" >/dev/null 2>&1 <<<"$object"; then
-				log "Ready: ${resource}/${name}"
+				if ((failure_first_seen >= 0)); then
+					failure_elapsed=$((SECONDS - failure_first_seen))
+					log "Ready after recovering from a transient ${description} error (${failure_elapsed}s): ${resource}/${name}"
+				else
+					log "Ready: ${resource}/${name}"
+				fi
 				return 0
 			fi
 			if jq -e "$failure_expression" >/dev/null 2>&1 <<<"$object"; then
-				log "${description} failed: ${resource}/${name}" >&2
-				kubectl get "$resource" "$name" -n "$NAMESPACE" -o yaml >&2 2>/dev/null || true
-				return 1
+				if ((failure_first_seen < 0)); then
+					failure_first_seen=$SECONDS
+					failure_message="$(jq -r '.status.error.message? // empty' <<<"$object" | tr '\n' ' ')"
+					failure_message="${failure_message:0:1000}"
+					if ((failure_grace_seconds > 0)); then
+						log "Transient ${description} error reported; allowing ${failure_grace_seconds}s for controller recovery: ${resource}/${name}" >&2
+						[[ -z "$failure_message" ]] || log "Transient error: ${failure_message}" >&2
+					fi
+				fi
+
+				failure_elapsed=$((SECONDS - failure_first_seen))
+				if ((failure_elapsed >= failure_grace_seconds)); then
+					log "${description} failed after its error persisted for ${failure_elapsed}s: ${resource}/${name}" >&2
+					kubectl get "$resource" "$name" -n "$NAMESPACE" -o yaml >&2 2>/dev/null || true
+					return 1
+				fi
+			elif ((failure_first_seen >= 0)); then
+				failure_elapsed=$((SECONDS - failure_first_seen))
+				log "Transient ${description} error cleared after ${failure_elapsed}s; continuing to wait: ${resource}/${name}"
+				failure_first_seen=-1
+				failure_message=""
 			fi
 		fi
 		sleep "$POLL_INTERVAL_SECONDS"
@@ -480,22 +556,98 @@ virtctl_ssh() {
 		"vm/${vm_name}"
 }
 
-wait_for_guest_ssh() {
+run_ssh_probe() {
 	local vm_name="$1"
-	local deadline=$((SECONDS + TIMEOUT_SECONDS))
+	local command="$2"
+	local output=""
+	local exit_code=0
 
-	log "Waiting for SSH access to VM ${vm_name}"
+	if output="$(virtctl_ssh "$vm_name" "$command" 2>&1)"; then
+		LAST_SSH_ERROR=""
+		return 0
+	else
+		exit_code=$?
+	fi
+	LAST_SSH_ERROR="$(sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g; s/\r$//' <<<"$output" | tail -n 12)"
+	return "$exit_code"
+}
+
+log_last_ssh_error() {
+	local line=""
+
+	if [[ -z "$LAST_SSH_ERROR" ]]; then
+		log "Last SSH probe produced no error output" >&2
+		return
+	fi
+	while IFS= read -r line; do
+		[[ -n "$line" ]] && log "Last SSH probe: ${line}" >&2
+	done <<<"$LAST_SSH_ERROR"
+}
+
+wait_for_ssh_stage() {
+	local vm_name="$1"
+	local deadline="$2"
+	local stage="$3"
+	local command="$4"
+	local success_message="$5"
+	local started_at=$SECONDS
+	local next_progress_at=$((SECONDS + 60))
+	local remaining=0
+
+	SSH_FAILURE_STAGE="$stage"
+	log "Waiting for guest readiness stage '${stage}' on VM ${vm_name}"
 	while ((SECONDS < deadline)); do
-		if virtctl_ssh "$vm_name" \
-			"command -v base64 >/dev/null && command -v bash >/dev/null && sudo -n true" >/dev/null 2>&1; then
-			log "SSH and passwordless sudo are ready on VM ${vm_name}"
+		if run_ssh_probe "$vm_name" "$command"; then
+			log "Ready: ${success_message} on VM ${vm_name}"
+			SSH_FAILURE_STAGE=""
 			return 0
+		fi
+		if ((SECONDS >= next_progress_at)); then
+			remaining=$((deadline - SECONDS))
+			if ((remaining < 0)); then
+				remaining=0
+			fi
+			log "Still waiting for guest readiness stage '${stage}' on VM ${vm_name} ($((SECONDS - started_at))s elapsed, ${remaining}s remaining)"
+			next_progress_at=$((SECONDS + 60))
 		fi
 		sleep "$POLL_INTERVAL_SECONDS"
 	done
 
-	log "Timed out waiting for SSH access to VM ${vm_name}" >&2
+	log "Timed out during guest readiness stage '${stage}' on VM ${vm_name}" >&2
+	log_last_ssh_error
 	return 1
+}
+
+wait_for_guest_ssh() {
+	local vm_name="$1"
+	local deadline=$((SECONDS + SSH_TIMEOUT_SECONDS))
+	local guest_addresses=""
+
+	CURRENT_FAILURE_CATEGORY="guest-readiness-failure"
+	SSH_FAILURE_STAGE=""
+	LAST_SSH_ERROR=""
+	guest_addresses="$(kubectl get virtualmachineinstances.kubevirt.io "$vm_name" -n "$NAMESPACE" -o json 2>/dev/null |
+		jq -r '[.status.interfaces[]? | .ipAddress? // empty | select(. != "")] | unique | join(", ")' 2>/dev/null || true)"
+	if [[ -n "$guest_addresses" ]]; then
+		log "Guest-reported IP address(es) for VM ${vm_name}: ${guest_addresses}"
+	else
+		log "Guest IP address is not yet reported for VM ${vm_name}; continuing with virtctl SSH probes"
+	fi
+
+	wait_for_ssh_stage "$vm_name" "$deadline" \
+		"ssh-connectivity-and-authentication" \
+		"true" \
+		"SSH connection and key authentication" || return 1
+	wait_for_ssh_stage "$vm_name" "$deadline" \
+		"required-guest-commands" \
+		"for command in base64 bash; do command -v \"\$command\" >/dev/null || { echo \"required guest command not found: \$command\" >&2; exit 1; }; done" \
+		"required guest commands" || return 1
+	wait_for_ssh_stage "$vm_name" "$deadline" \
+		"passwordless-sudo" \
+		"sudo -n true" \
+		"passwordless sudo" || return 1
+
+	log "All guest readiness stages passed on VM ${vm_name}"
 }
 
 run_guest_script() {
@@ -516,6 +668,95 @@ run_guest_script() {
 	done
 
 	virtctl_ssh "$vm_name" "$remote_command"
+}
+
+is_transient_ssh_failure() {
+	local exit_code="$1"
+	local output="$2"
+	local normalized_output="${output,,}"
+
+	if ((exit_code == 255)); then
+		return 0
+	fi
+	case "$normalized_output" in
+	*"exit status 255"* | \
+		*"connection timed out during banner exchange"* | \
+		*"websocket: close"* | \
+		*"unexpected eof"* | \
+		*"broken pipe"* | \
+		*"connection reset by peer"* | \
+		*"connection closed by"* | \
+		*"connect: connection refused"* | \
+		*"internal error occurred: dialing vm"* | \
+		*"tls handshake timeout"* | \
+		*"i/o timeout"* | \
+		*"context deadline exceeded"*)
+		return 0
+		;;
+	esac
+	return 1
+}
+
+run_guest_script_with_transport_retry() {
+	local description="$1"
+	local vm_name="$2"
+	local script="$3"
+	shift 3
+
+	local deadline=$((SECONDS + SSH_TIMEOUT_SECONDS))
+	local error_file=""
+	local error_output=""
+	local exit_code=0
+	local output=""
+	local remaining=0
+	local retry_delay=0
+	local retry_count=0
+	local transient_summary=""
+
+	error_file="$(mktemp "${STRESS_TMP_DIR}/verification-ssh.XXXXXX")"
+	while true; do
+		if output="$(run_guest_script "$vm_name" "$script" "$@" 2>"$error_file")"; then
+			if [[ -s "$error_file" ]]; then
+				cat "$error_file" >&2
+			fi
+			rm -f -- "$error_file"
+			if ((retry_count > 0)); then
+				log "Retrieved ${description} after ${retry_count} transient SSH retry(s)" >&2
+			fi
+			printf '%s\n' "$output"
+			return 0
+		else
+			exit_code=$?
+		fi
+
+		error_output="$(<"$error_file")"
+		if ! is_transient_ssh_failure "$exit_code" "${output}"$'\n'"${error_output}"; then
+			[[ -z "$output" ]] || printf '%s\n' "$output" >&2
+			[[ -z "$error_output" ]] || printf '%s\n' "$error_output" >&2
+			rm -f -- "$error_file"
+			return "$exit_code"
+		fi
+
+		transient_summary="$(printf '%s\n%s\n' "$output" "$error_output" |
+			sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g; s/\r$//' |
+			sed '/^[[:space:]]*$/d' | tail -n 1)"
+		remaining=$((deadline - SECONDS))
+		if ((remaining <= 0)); then
+			log "Unable to retrieve ${description}: transient SSH failure persisted for ${SSH_TIMEOUT_SECONDS}s" >&2
+			[[ -z "$transient_summary" ]] || log "Last SSH error: ${transient_summary}" >&2
+			rm -f -- "$error_file"
+			return 75
+		fi
+
+		retry_count=$((retry_count + 1))
+		retry_delay=$POLL_INTERVAL_SECONDS
+		if ((retry_delay > remaining)); then
+			retry_delay=$remaining
+		fi
+		log "Transient SSH failure retrieving ${description}; retry ${retry_count} in ${retry_delay}s (${remaining}s remaining)" >&2
+		[[ -z "$transient_summary" ]] || log "SSH error: ${transient_summary}" >&2
+		sleep "$retry_delay"
+	done
 }
 
 write_root_payload() {
@@ -558,7 +799,7 @@ read_root_payload() {
 	local vm_name="$1"
 	local payload_name="$2"
 
-	run_guest_script "$vm_name" 'set -Eeuo pipefail
+	run_guest_script_with_transport_retry "restored root-disk checksum" "$vm_name" 'set -Eeuo pipefail
 
 payload_directory="$1"
 payload_name="$2"
@@ -665,7 +906,7 @@ read_guest_payload() {
 	local vm_name="$1"
 	local payload_name="$2"
 
-	run_guest_script "$vm_name" 'set -Eeuo pipefail
+	run_guest_script_with_transport_retry "restored data-disk checksum" "$vm_name" 'set -Eeuo pipefail
 
 device="$1"
 mount_path="$2"
@@ -899,6 +1140,7 @@ clear_iteration_state() {
 	CURRENT_RESTORED_VM=""
 	CURRENT_ITERATION=""
 	CURRENT_BOOT_PVC=""
+	CURRENT_DIAGNOSTICS_COLLECTED=false
 }
 
 cleanup_iteration() {
@@ -928,6 +1170,120 @@ cleanup_image() {
 	delete_resource virtualmachineimages.harvesterhci.io "$IMAGE_NAME"
 }
 
+dump_named_resource() {
+	local resource="$1"
+	local name="$2"
+
+	[[ -n "$name" ]] || return 0
+	if kubectl get "$resource" "$name" -n "$NAMESPACE" >/dev/null 2>&1; then
+		log "Diagnostic YAML: ${resource}/${name}" >&2
+		kubectl get "$resource" "$name" -n "$NAMESPACE" -o yaml >&2 2>/dev/null || true
+	fi
+}
+
+dump_object_events() {
+	local name="$1"
+
+	[[ -n "$name" ]] || return 0
+	log "Diagnostic events involving ${name}:" >&2
+	kubectl get events -n "$NAMESPACE" \
+		--field-selector "involvedObject.name=${name}" \
+		--sort-by='.lastTimestamp' -o wide >&2 2>/dev/null || true
+}
+
+dump_iteration_diagnostics() {
+	local selector="${STRESS_RUN_LABEL}=${RUN_ID},${STRESS_ITERATION_LABEL}=${CURRENT_ITERATION}"
+	local launcher_pods=""
+	local pod=""
+	local container=""
+	local pvc_names=""
+	local claim=""
+	local pv=""
+
+	CURRENT_DIAGNOSTICS_COLLECTED=true
+	log "Failure category: ${CURRENT_FAILURE_CATEGORY:-iteration-failure}" >&2
+	if [[ -n "$SSH_FAILURE_STAGE" ]]; then
+		log "Guest readiness stage at failure: ${SSH_FAILURE_STAGE}" >&2
+	fi
+	log "Collecting diagnostics before cleanup for ${CURRENT_ITERATION}" >&2
+	log "Resources selected by ${selector@Q}:" >&2
+	kubectl get \
+		virtualmachinebackups.harvesterhci.io,virtualmachinerestores.harvesterhci.io,virtualmachines.kubevirt.io,virtualmachineinstances.kubevirt.io,datavolumes.cdi.kubevirt.io,pvc,pods \
+		-n "$NAMESPACE" -l "$selector" -o wide >&2 2>/dev/null || true
+
+	dump_named_resource virtualmachines.kubevirt.io "$CURRENT_VM"
+	dump_named_resource virtualmachineinstances.kubevirt.io "$CURRENT_VM"
+	dump_named_resource virtualmachinebackups.harvesterhci.io "$CURRENT_BACKUP"
+	dump_named_resource virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE"
+	dump_named_resource virtualmachines.kubevirt.io "$CURRENT_RESTORED_VM"
+	dump_named_resource virtualmachineinstances.kubevirt.io "$CURRENT_RESTORED_VM"
+
+	launcher_pods="$(kubectl get pods -n "$NAMESPACE" -o json 2>/dev/null |
+		jq -r --arg source "$CURRENT_VM" --arg restored "$CURRENT_RESTORED_VM" '
+          .items[]
+          | select(.metadata.labels["kubevirt.io"] == "virt-launcher")
+          | select(
+              .metadata.labels["vm.kubevirt.io/name"] == $source or
+              .metadata.labels["kubevirt.io/domain"] == $source or
+              .metadata.labels["vm.kubevirt.io/name"] == $restored or
+              .metadata.labels["kubevirt.io/domain"] == $restored
+            )
+          | .metadata.name
+        ' 2>/dev/null || true)"
+	while IFS= read -r pod; do
+		[[ -n "$pod" ]] || continue
+		log "Diagnostic description: pod/${pod}" >&2
+		kubectl describe pod "$pod" -n "$NAMESPACE" >&2 2>/dev/null || true
+		for container in compute guest-console-log; do
+			if kubectl get pod "$pod" -n "$NAMESPACE" -o json 2>/dev/null |
+				jq -e --arg container "$container" '
+                  [.spec.containers[]?, .spec.initContainers[]?]
+                  | any(.name == $container)
+                ' >/dev/null 2>&1; then
+				log "Last 200 log lines from pod/${pod} container ${container}:" >&2
+				kubectl logs "$pod" -n "$NAMESPACE" -c "$container" --tail=200 --timestamps >&2 2>/dev/null || true
+			fi
+		done
+		dump_object_events "$pod"
+	done <<<"$launcher_pods"
+
+	pvc_names="$(
+		{
+			kubectl get pvc -n "$NAMESPACE" -l "$selector" -o json 2>/dev/null |
+				jq -r '.items[].metadata.name' 2>/dev/null || true
+			if [[ -n "$CURRENT_RESTORE" ]]; then
+				kubectl get virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE" -n "$NAMESPACE" -o json 2>/dev/null |
+					jq -r '.status.restores[]?.persistentVolumeClaimSpec.metadata.name // empty' 2>/dev/null || true
+			fi
+			[[ -n "$CURRENT_BOOT_PVC" ]] && printf '%s\n' "$CURRENT_BOOT_PVC"
+		} | sort -u
+	)"
+	while IFS= read -r claim; do
+		[[ -n "$claim" ]] || continue
+		dump_named_resource pvc "$claim"
+		pv="$(kubectl get pvc "$claim" -n "$NAMESPACE" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
+		if [[ -n "$pv" ]]; then
+			log "Diagnostic YAML: persistentvolume/${pv}" >&2
+			kubectl get persistentvolume "$pv" -o yaml >&2 2>/dev/null || true
+			log "VolumeAttachment state for persistentvolume/${pv}:" >&2
+			kubectl get volumeattachments.storage.k8s.io -o json 2>/dev/null |
+				jq --arg pv "$pv" '[.items[] | select(.spec.source.persistentVolumeName == $pv) | {
+                  name: .metadata.name,
+                  attacher: .spec.attacher,
+                  nodeName: .spec.nodeName,
+                  attached: .status.attached,
+                  attachError: .status.attachError,
+                  detachError: .status.detachError
+                }]' >&2 2>/dev/null || true
+		fi
+	done <<<"$pvc_names"
+
+	for pod in "$CURRENT_VM" "$CURRENT_RESTORED_VM" "$CURRENT_BACKUP" "$CURRENT_RESTORE"; do
+		dump_object_events "$pod"
+	done
+	log "Finished diagnostics for ${CURRENT_ITERATION}" >&2
+}
+
 dump_diagnostics() {
 	log "Stress-test resources at failure:" >&2
 	kubectl get virtualmachineimages.harvesterhci.io,virtualmachinebackups.harvesterhci.io,virtualmachinerestores.harvesterhci.io,virtualmachines.kubevirt.io,pvc,pods \
@@ -950,13 +1306,21 @@ terminate_workers() {
 
 on_exit() {
 	local exit_code=$?
+	local keep_local_diagnostics=false
 	trap - EXIT INT TERM
 	terminate_workers
 
 	if ((exit_code != 0)); then
 		dump_diagnostics
 	fi
-	if [[ "$KEEP_RESOURCES" == false ]]; then
+	if [[ "$KEEP_RESOURCES" == true ]]; then
+		log "Keeping resources with label ${STRESS_RUN_LABEL}=${RUN_ID}"
+		keep_local_diagnostics=true
+	elif ((exit_code != 0)) && [[ "$PARENT_SIGNALLED" == false ]] && [[ "$KEEP_FAILED_RESOURCES" == true ]]; then
+		log "Keeping failed-iteration resources and shared image with label ${STRESS_RUN_LABEL}=${RUN_ID}"
+		log "Use --cleanup-run ${RUN_ID} when investigation is complete"
+		keep_local_diagnostics=true
+	else
 		if ((exit_code != 0)) && [[ -n "$RUN_ID" ]]; then
 			# A parent process cannot see a background worker's shell-local state.
 			# Sweep by the run label and generated-name prefixes after all workers stop.
@@ -966,10 +1330,11 @@ on_exit() {
 			cleanup_iteration || true
 			cleanup_image || true
 		fi
-	else
-		log "Keeping resources with label ${STRESS_RUN_LABEL}=${RUN_ID}"
 	fi
-	if [[ -n "$STRESS_TMP_DIR" && -d "$STRESS_TMP_DIR" ]]; then
+	if [[ "$keep_local_diagnostics" == true ]] && [[ -n "$STRESS_TMP_DIR" && -d "$STRESS_TMP_DIR" ]]; then
+		log "Keeping local diagnostics and SSH identity in ${STRESS_TMP_DIR}"
+		log "Remove ${STRESS_TMP_DIR} manually after investigation"
+	elif [[ -n "$STRESS_TMP_DIR" && -d "$STRESS_TMP_DIR" ]]; then
 		rm -rf -- "$STRESS_TMP_DIR"
 	fi
 	exit "$exit_code"
@@ -981,8 +1346,8 @@ if [[ "$CLEANUP_MODE" == true ]]; then
 fi
 
 trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'PARENT_SIGNALLED=true; exit 130' INT
+trap 'PARENT_SIGNALLED=true; exit 143' TERM
 
 kubectl get namespace "$NAMESPACE" >/dev/null
 kubectl get storageclass "$IMAGE_STORAGE_CLASS" >/dev/null
@@ -1001,6 +1366,7 @@ log "Run ID: ${RUN_ID}"
 log "Boot PVC: ${BOOT_SIZE_GIB}Gi ${BOOT_VOLUME_MODE} ${BOOT_ACCESS_MODE} on ${IMAGE_STORAGE_CLASS}"
 log "Data PVC: ${DATA_VOLUME_SIZE_GIB}Gi ${DATA_VOLUME_MODE} ${DATA_ACCESS_MODE} on ${DATA_STORAGE_CLASS}"
 log "VM network: ${NETWORK_NAME}; guest interface: ${GUEST_INTERFACE_NAME}"
+log "Timeouts: cluster operations ${TIMEOUT_SECONDS}s; snapshot error grace ${SNAPSHOT_ERROR_GRACE_SECONDS}s; guest SSH readiness/checksum retries ${SSH_TIMEOUT_SECONDS}s; fresh VM retries ${SSH_VM_RETRIES}"
 
 log "Creating VirtualMachineImage ${NAMESPACE}/${IMAGE_NAME}"
 jq -n \
@@ -1202,7 +1568,10 @@ create_iteration_vm() {
 run_iteration() {
 	local worker="$1"
 	local iteration="$2"
-	local iteration_id="worker-${worker}-iteration-${iteration}"
+	local attempt="${3:-1}"
+	local max_attempts=$((SSH_VM_RETRIES + 1))
+	local attempt_suffix=""
+	local iteration_id=""
 	local VM_JSON=""
 	local DATA_PVC_NAME=""
 	local ROOT_PAYLOAD_NAME=""
@@ -1212,27 +1581,48 @@ run_iteration() {
 	local RESTORED_DATA_PVC=""
 	local ROOT_RESTORED_CHECKSUM=""
 	local DATA_RESTORED_CHECKSUM=""
+	local read_exit_code=0
 
+	if ((attempt > 1)); then
+		attempt_suffix="-a${attempt}"
+	fi
+	iteration_id="worker-${worker}-iteration-${iteration}${attempt_suffix}"
 	CURRENT_ITERATION="$iteration_id"
-	CURRENT_VM="$(resource_name "${RUN_ID}-worker-${worker}-vm-${iteration}")"
-	CURRENT_BACKUP="$(resource_name "${RUN_ID}-worker-${worker}-snapshot-${iteration}")"
-	CURRENT_RESTORE="$(resource_name "${RUN_ID}-worker-${worker}-restore-${iteration}")"
-	CURRENT_RESTORED_VM="$(resource_name "${RUN_ID}-worker-${worker}-restored-${iteration}")"
-	VM_JSON="${STRESS_TMP_DIR}/worker-${worker}-vm-${iteration}.json"
+	CURRENT_VM="$(resource_name "${RUN_ID}-worker-${worker}-vm-${iteration}${attempt_suffix}")"
+	CURRENT_BACKUP="$(resource_name "${RUN_ID}-worker-${worker}-snapshot-${iteration}${attempt_suffix}")"
+	CURRENT_RESTORE="$(resource_name "${RUN_ID}-worker-${worker}-restore-${iteration}${attempt_suffix}")"
+	CURRENT_RESTORED_VM="$(resource_name "${RUN_ID}-worker-${worker}-restored-${iteration}${attempt_suffix}")"
+	VM_JSON="${STRESS_TMP_DIR}/worker-${worker}-vm-${iteration}${attempt_suffix}.json"
 	CURRENT_BOOT_PVC="${CURRENT_VM}-pvc-${BOOT_TEMPLATE_INDEX}"
 	DATA_PVC_NAME="${CURRENT_VM}-pvc-${DATA_TEMPLATE_INDEX}"
 	ROOT_PAYLOAD_NAME=".csi-stress-${RUN_ID}-${iteration_id}-root.bin"
 	DATA_PAYLOAD_NAME=".csi-stress-${RUN_ID}-${iteration_id}-data.bin"
+	CURRENT_FAILURE_CATEGORY="vm-creation-failure"
+	SSH_FAILURE_STAGE=""
+	LAST_SSH_ERROR=""
+	CURRENT_DIAGNOSTICS_COLLECTED=false
 
-	log "Starting iteration ${iteration}/${ITERATIONS}"
+	log "Starting iteration ${iteration}/${ITERATIONS} (attempt ${attempt}/${max_attempts})"
 	log "Creating VM ${NAMESPACE}/${CURRENT_VM}"
 	create_iteration_vm "$iteration_id" "$VM_JSON"
+	CURRENT_FAILURE_CATEGORY="vm-readiness-failure"
 	wait_for_resource virtualmachines.kubevirt.io "$CURRENT_VM" '.status.ready == true' "source VM"
+	CURRENT_FAILURE_CATEGORY="storage-provisioning-failure"
 	wait_for_resource pvc "$CURRENT_BOOT_PVC" '.status.phase == "Bound"' "block boot PVC"
 	label_boot_storage_resources "$CURRENT_BOOT_PVC" "$iteration_id"
 	wait_for_resource pvc "$DATA_PVC_NAME" '.status.phase == "Bound"' "filesystem data PVC"
-	wait_for_guest_ssh "$CURRENT_VM"
+	if ! wait_for_guest_ssh "$CURRENT_VM"; then
+		dump_iteration_diagnostics || true
+		if ((attempt < max_attempts)); then
+			log "Guest readiness failed for source VM ${CURRENT_VM}; retrying iteration ${iteration} with a fresh VM (attempt $((attempt + 1))/${max_attempts})" >&2
+			cleanup_iteration
+			run_iteration "$worker" "$iteration" "$((attempt + 1))"
+			return
+		fi
+		return 1
+	fi
 
+	CURRENT_FAILURE_CATEGORY="guest-io-failure"
 	log "Writing ${ROOT_DATA_SIZE_GIB} GiB of data to the source root disk in VM ${CURRENT_VM}"
 	ROOT_SOURCE_CHECKSUM="$(write_root_payload "$CURRENT_VM" "$ROOT_PAYLOAD_NAME")"
 	[[ "$ROOT_SOURCE_CHECKSUM" =~ ^[a-f0-9]{64}$ ]] ||
@@ -1245,6 +1635,7 @@ run_iteration() {
 		fail "invalid source data-disk checksum: ${DATA_SOURCE_CHECKSUM@Q}"
 	log "Source data-disk checksum: ${DATA_SOURCE_CHECKSUM}"
 
+	CURRENT_FAILURE_CATEGORY="snapshot-failure"
 	log "Creating VM snapshot ${NAMESPACE}/${CURRENT_BACKUP}"
 	jq -n \
 		--arg namespace "$NAMESPACE" \
@@ -1270,13 +1661,16 @@ run_iteration() {
       }
 	    ' | kubectl apply -f - >/dev/null
 	wait_for_resource virtualmachinebackups.harvesterhci.io "$CURRENT_BACKUP" \
-		'.status.readyToUse == true' "VM snapshot" '.status.error.message? != null'
+		'.status.readyToUse == true' "VM snapshot" '.status.error.message? != null' \
+		"$SNAPSHOT_ERROR_GRACE_SECONDS"
 
+	CURRENT_FAILURE_CATEGORY="source-vm-stop-failure"
 	log "Stopping source VM ${CURRENT_VM} before starting its restored copy"
 	kubectl patch virtualmachines.kubevirt.io "$CURRENT_VM" -n "$NAMESPACE" \
 		--type merge -p '{"spec":{"runStrategy":"Halted"}}' >/dev/null
 	wait_for_launcher_absent "$CURRENT_VM"
 
+	CURRENT_FAILURE_CATEGORY="restore-failure"
 	log "Restoring snapshot ${CURRENT_BACKUP} to VM ${CURRENT_RESTORED_VM}"
 	jq -n \
 		--arg namespace "$NAMESPACE" \
@@ -1313,24 +1707,56 @@ run_iteration() {
     ')"
 	[[ -n "$RESTORED_DATA_PVC" ]] || fail "restore status does not contain a PVC for VM volume ${DATA_VOLUME_NAME}"
 	wait_for_resource pvc "$RESTORED_DATA_PVC" '.status.phase == "Bound"' "restored filesystem data PVC"
-	wait_for_guest_ssh "$CURRENT_RESTORED_VM"
+	if ! wait_for_guest_ssh "$CURRENT_RESTORED_VM"; then
+		dump_iteration_diagnostics || true
+		if ((attempt < max_attempts)); then
+			log "Guest readiness failed for restored VM ${CURRENT_RESTORED_VM}; retrying iteration ${iteration} with a fresh source VM (attempt $((attempt + 1))/${max_attempts})" >&2
+			cleanup_iteration
+			run_iteration "$worker" "$iteration" "$((attempt + 1))"
+			return
+		fi
+		return 1
+	fi
 
+	CURRENT_FAILURE_CATEGORY="integrity-read-failure"
 	log "Checking data checksum on the restored root disk in VM ${CURRENT_RESTORED_VM}"
-	ROOT_RESTORED_CHECKSUM="$(read_root_payload "$CURRENT_RESTORED_VM" "$ROOT_PAYLOAD_NAME")"
-	[[ "$ROOT_RESTORED_CHECKSUM" =~ ^[a-f0-9]{64}$ ]] ||
+	if ROOT_RESTORED_CHECKSUM="$(read_root_payload "$CURRENT_RESTORED_VM" "$ROOT_PAYLOAD_NAME")"; then
+		:
+	else
+		read_exit_code=$?
+		if ((read_exit_code == 75)); then
+			CURRENT_FAILURE_CATEGORY="integrity-transport-failure"
+		fi
+		return "$read_exit_code"
+	fi
+	if [[ ! "$ROOT_RESTORED_CHECKSUM" =~ ^[a-f0-9]{64}$ ]]; then
+		CURRENT_FAILURE_CATEGORY="integrity-output-failure"
 		fail "invalid restored root-disk checksum: ${ROOT_RESTORED_CHECKSUM@Q}"
+	fi
 	log "Restored root-disk checksum: ${ROOT_RESTORED_CHECKSUM}"
 
 	log "Checking data checksum on restored data disk ${GUEST_DEVICE} in VM ${CURRENT_RESTORED_VM}"
-	DATA_RESTORED_CHECKSUM="$(read_guest_payload "$CURRENT_RESTORED_VM" "$DATA_PAYLOAD_NAME")"
-	[[ "$DATA_RESTORED_CHECKSUM" =~ ^[a-f0-9]{64}$ ]] ||
+	if DATA_RESTORED_CHECKSUM="$(read_guest_payload "$CURRENT_RESTORED_VM" "$DATA_PAYLOAD_NAME")"; then
+		:
+	else
+		read_exit_code=$?
+		if ((read_exit_code == 75)); then
+			CURRENT_FAILURE_CATEGORY="integrity-transport-failure"
+		fi
+		return "$read_exit_code"
+	fi
+	if [[ ! "$DATA_RESTORED_CHECKSUM" =~ ^[a-f0-9]{64}$ ]]; then
+		CURRENT_FAILURE_CATEGORY="integrity-output-failure"
 		fail "invalid restored data-disk checksum: ${DATA_RESTORED_CHECKSUM@Q}"
+	fi
 	log "Restored data-disk checksum: ${DATA_RESTORED_CHECKSUM}"
 
 	if [[ "$ROOT_SOURCE_CHECKSUM" != "$ROOT_RESTORED_CHECKSUM" ]]; then
+		CURRENT_FAILURE_CATEGORY="integrity-mismatch"
 		fail "root-disk integrity failure in ${iteration_id}: source=${ROOT_SOURCE_CHECKSUM}, restored=${ROOT_RESTORED_CHECKSUM}"
 	fi
 	if [[ "$DATA_SOURCE_CHECKSUM" != "$DATA_RESTORED_CHECKSUM" ]]; then
+		CURRENT_FAILURE_CATEGORY="integrity-mismatch"
 		fail "data-disk integrity failure in ${iteration_id}: source=${DATA_SOURCE_CHECKSUM}, restored=${DATA_RESTORED_CHECKSUM}"
 	fi
 	log "Iteration ${iteration} passed root- and data-disk integrity verification"
@@ -1338,9 +1764,24 @@ run_iteration() {
 
 worker_on_exit() {
 	local exit_code=$?
+	local preserve_failed_iteration=false
 	trap - EXIT INT TERM
 
-	if [[ "$KEEP_RESOURCES" == false ]]; then
+	if ((exit_code != 0)) && [[ "$WORKER_SIGNALLED" == false ]] && [[ -n "$CURRENT_ITERATION" ]]; then
+		if [[ "$CURRENT_DIAGNOSTICS_COLLECTED" == false ]]; then
+			dump_iteration_diagnostics || true
+		fi
+		if [[ "$KEEP_FAILED_RESOURCES" == true ]]; then
+			preserve_failed_iteration=true
+		fi
+	fi
+
+	if [[ "$KEEP_RESOURCES" == true ]]; then
+		:
+	elif [[ "$preserve_failed_iteration" == true ]]; then
+		log "Keeping failed resources from ${CURRENT_ITERATION} for investigation"
+		log "Resource selector: ${STRESS_RUN_LABEL}=${RUN_ID},${STRESS_ITERATION_LABEL}=${CURRENT_ITERATION}"
+	else
 		cleanup_iteration || true
 	fi
 	exit "$exit_code"
@@ -1350,14 +1791,16 @@ run_iteration_worker() {
 	local worker="$1"
 	local iteration=0
 
+	WORKER_SIGNALLED=false
 	trap worker_on_exit EXIT
-	trap 'exit 130' INT
-	trap 'exit 143' TERM
+	trap 'WORKER_SIGNALLED=true; exit 130' INT
+	trap 'WORKER_SIGNALLED=true; exit 143' TERM
 
 	for ((iteration = 1; iteration <= ITERATIONS; iteration++)); do
 		LOG_PREFIX="[worker ${worker}, iteration ${iteration}] "
 		run_iteration "$worker" "$iteration"
 		if [[ "$KEEP_RESOURCES" == false ]]; then
+			CURRENT_FAILURE_CATEGORY="cleanup-failure"
 			cleanup_iteration
 		else
 			clear_iteration_state

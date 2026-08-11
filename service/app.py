@@ -77,7 +77,10 @@ PARAMETERS = [
         "required": True,
         "group": "Cluster connection",
         "modes": ["stress", "cleanup_run", "cleanup_all"],
-        "help": "Maximum wait for each asynchronous cluster operation.",
+        "help": (
+            "Maximum wait for each asynchronous cluster operation and cleanup action; "
+            "guest SSH uses its own timeout."
+        ),
     },
     {
         "key": "image_url",
@@ -281,6 +284,21 @@ PARAMETERS = [
         "modes": ["stress"],
     },
     {
+        "key": "snapshot_error_grace",
+        "label": "Snapshot error grace",
+        "type": "number",
+        "default": 60,
+        "min": 0,
+        "suffix": "seconds",
+        "required": True,
+        "group": "Workload",
+        "modes": ["stress"],
+        "help": (
+            "Continue waiting after a VM snapshot reports an error so controller "
+            "retries can recover. Set to 0 for fail-fast behavior."
+        ),
+    },
+    {
         "key": "ssh_user",
         "label": "SSH user",
         "type": "text",
@@ -288,6 +306,35 @@ PARAMETERS = [
         "required": True,
         "group": "Guest access",
         "modes": ["stress"],
+    },
+    {
+        "key": "ssh_timeout",
+        "label": "SSH timeout",
+        "type": "number",
+        "default": 900,
+        "min": 1,
+        "suffix": "seconds",
+        "required": True,
+        "group": "Guest access",
+        "modes": ["stress"],
+        "help": (
+            "Total time allowed for guest SSH readiness and for retrying transient "
+            "SSH or virtctl failures while retrieving restored checksums."
+        ),
+    },
+    {
+        "key": "ssh_vm_retries",
+        "label": "Fresh VM retries",
+        "type": "number",
+        "default": 0,
+        "min": 0,
+        "required": True,
+        "group": "Guest access",
+        "modes": ["stress"],
+        "help": (
+            "Additional full iteration attempts with newly created VMs after source or "
+            "restored guest SSH readiness times out."
+        ),
     },
     {
         "key": "ssh_identity_file",
@@ -325,6 +372,15 @@ PARAMETERS = [
         "group": "Guest access",
         "modes": ["stress"],
         "help": "Retain generated resources for debugging instead of deleting them.",
+    },
+    {
+        "key": "keep_failed_resources",
+        "label": "Keep only failed iteration resources",
+        "type": "checkbox",
+        "default": False,
+        "group": "Guest access",
+        "modes": ["stress"],
+        "help": "Retain a failed iteration and the shared image for diagnosis while still cleaning successful iterations.",
     },
     {
         "key": "cleanup_run_id",
@@ -380,7 +436,19 @@ def classify_log(message: str, stream: str) -> str:
         or lowered.startswith("completed")
     ):
         return "success"
-    if lowered.startswith(("waiting", "creating", "starting", "writing", "reading", "restoring", "stopping", "cleaning")):
+    activity_prefixes = (
+        "waiting",
+        "still waiting",
+        "creating",
+        "starting",
+        "writing",
+        "reading",
+        "restoring",
+        "retrying",
+        "stopping",
+        "cleaning",
+    )
+    if lowered.startswith(activity_prefixes):
         return "activity"
     return "info"
 
@@ -428,7 +496,8 @@ def normalize_config(payload: Any) -> dict[str, Any]:
 
         if parameter["type"] == "number":
             if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value).strip()):
-                raise ConfigError(f"{parameter['label']} must be a positive integer")
+                integer_kind = "non-negative" if parameter.get("min", 1) == 0 else "positive"
+                raise ConfigError(f"{parameter['label']} must be a {integer_kind} integer")
             number = int(value)
             if number < parameter.get("min", 1):
                 raise ConfigError(f"{parameter['label']} must be at least {parameter.get('min', 1)}")
@@ -445,6 +514,8 @@ def normalize_config(payload: Any) -> dict[str, Any]:
     config["kubeconfig"] = validate_kubeconfig(config["kubeconfig"])
 
     if mode == "stress":
+        if config["keep_resources"] and config["keep_failed_resources"]:
+            raise ConfigError("Keep resources and keep only failed iteration resources cannot both be enabled")
         for key in ("boot_volume_mode", "data_volume_mode", "boot_access_mode", "data_access_mode"):
             options = PARAMETER_BY_KEY[key]["options"]
             if config[key] not in options:
@@ -501,7 +572,10 @@ def build_command(config: dict[str, Any]) -> list[str]:
             ("--data-size-gib", "data_size_gib"),
             ("--root-data-size-gib", "root_data_size_gib"),
             ("--poll-interval", "poll_interval"),
+            ("--snapshot-error-grace", "snapshot_error_grace"),
             ("--ssh-user", "ssh_user"),
+            ("--ssh-timeout", "ssh_timeout"),
+            ("--ssh-vm-retries", "ssh_vm_retries"),
             ("--guest-device", "guest_device"),
             ("--guest-mount-path", "guest_mount_path"),
         ]
@@ -511,6 +585,8 @@ def build_command(config: dict[str, Any]) -> list[str]:
             command.extend(["--ssh-identity-file", config["ssh_identity_file"]])
         if config["keep_resources"]:
             command.append("--keep-resources")
+        if config["keep_failed_resources"]:
+            command.append("--keep-failed-resources")
 
     command.extend(["--namespace", config["namespace"], "--timeout", str(config["timeout"])])
     return command

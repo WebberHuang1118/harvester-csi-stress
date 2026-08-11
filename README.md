@@ -11,12 +11,18 @@ iterations sequentially inside each worker. For example, `--parallel 3
 During each iteration, the test:
 
 1. Generates and creates a minimal KubeVirt VM with boot and data PVCs.
-2. Waits for the VM, both PVCs, and guest SSH access.
+2. Waits for the VM, both PVCs, and guest SSH access. Guest readiness uses a
+   dedicated timeout and can optionally retry the entire iteration with fresh
+   VMs.
 3. Writes random payloads to the root filesystem and data disk and records their
    SHA-256 checksums.
 4. Creates a Harvester `VirtualMachineBackup` with filesystem freeze enabled.
+   Transient snapshot errors remain visible in the log, but the test allows a
+   bounded recovery window for the snapshot controller's automatic retries.
 5. Stops the source VM and restores the backup as a new VM.
 6. Recalculates both checksums on the restored VM and verifies data integrity.
+   Checksum retrieval retries transient SSH/`virtctl` transport failures
+   without retrying or hiding a valid checksum mismatch.
 7. Removes the iteration resources unless resource retention is enabled.
 
 If one worker fails, the test stops the other active workers, prints cluster
@@ -105,14 +111,14 @@ running the service—not on the computer running the browser.
 Select **Stress test**, review the fields, and choose **Start stress test**. The
 GUI exposes every supported stress-test parameter in these groups:
 
-- **Cluster connection:** Kubeconfig, namespace, and per-operation timeout
+- **Cluster connection:** Kubeconfig, namespace, and per-operation cluster timeout
 - **VM and storage:** image URL, image/data storage classes, CPU, memory, PVC
   capacities, volume modes, and access modes
 - **VM network:** Multus network, guest interface name, and required node selector
 - **Workload:** iterations per worker, parallel workers, root/data payload sizes,
-  and polling interval
-- **Guest access:** SSH user/key, guest data device, mount path, and resource
-  retention
+  polling interval, and snapshot error grace
+- **Guest access:** SSH user/key, SSH timeout, fresh-VM retries, guest
+  data device, mount path, and resource retention
 
 The image storage class is used for both the Harvester VM image and every
 boot/root PVC. The data storage class is used for the additional data PVC.
@@ -127,6 +133,7 @@ Important GUI and CLI defaults are:
 | --- | --- |
 | Namespace | `default` |
 | Operation timeout | `3600` seconds |
+| SSH timeout / fresh VM retries | `900` seconds / `0` |
 | vCPU / memory | `2` / `4Gi` |
 | Boot PVC | `50Gi`, `Block`, `ReadWriteOnce` |
 | Data PVC | `100Gi`, `Filesystem`, `ReadWriteOnce` |
@@ -136,13 +143,16 @@ Important GUI and CLI defaults are:
 | Iterations / parallel workers | `1` / `1` |
 | Root / data payload | `1Gi` / `10Gi` |
 | Polling interval | `5` seconds |
+| Snapshot error grace | `60` seconds |
+| Checksum SSH retry timeout | `60` seconds |
 | SSH user | `ubuntu` |
 | Guest data device / mount | `/dev/vdb` / `/mnt/csi-stress` |
-| Keep resources | Disabled |
+| Keep all resources / keep failed resources | Disabled / disabled |
 
 The GUI validates values before launching the process. In particular:
 
-- Numeric settings must be positive integers.
+- Numeric settings must be positive integers, except fresh VM retries, which may
+  be zero.
 - The root payload must be smaller than the boot PVC capacity.
 - The data payload must be smaller than the data PVC capacity.
 - Kubeconfig and optional SSH identity files must exist on the service host.
@@ -191,6 +201,16 @@ exits.
 **Stop** asks for confirmation, sends a termination signal to the full process
 group, and allows the Bash cleanup traps to run.
 
+For intermittent failures, enable **Keep only failed iteration resources**.
+Successful iterations and workers stopped because another worker failed are
+still cleaned, while the actual failed iteration and shared image remain for
+inspection. The output prints the run and iteration label selectors. This option
+cannot be combined with **Keep resources after the run**. The local temporary
+directory is also retained so the generated SSH identity and VM manifests remain
+available; its path is printed and must be removed manually after investigation.
+When fresh-VM retries are enabled, failed intermediate attempts are diagnosed
+and cleaned before retrying; only the final failed attempt is retained.
+
 The GUI also provides two cleanup modes:
 
 - **Clean one run:** enter the run ID shown in the output to remove resources
@@ -232,7 +252,10 @@ NAMESPACE="default"
   --root-data-size-gib 1 \
   --data-size-gib 10 \
   --poll-interval 5 \
+  --snapshot-error-grace 60 \
   --ssh-user ubuntu \
+  --ssh-timeout 900 \
+  --ssh-vm-retries 1 \
   --guest-device /dev/vdb \
   --guest-mount-path /mnt/csi-stress \
   --namespace "$NAMESPACE" \
@@ -241,7 +264,17 @@ NAMESPACE="default"
 
 This example runs two workers concurrently, with three iterations per worker,
 for six snapshot/restore and integrity-check cycles in total. Iterations within
-one worker are sequential.
+one worker are sequential. If source or restored VM guest readiness exceeds 15
+minutes, that logical iteration is retried once with newly created VMs. Set
+`--ssh-vm-retries 0` to disable retries.
+
+By default, a VM snapshot error may recover for up to 60 seconds before the
+iteration fails. The first error and any recovery are logged. Set
+`--snapshot-error-grace 0` to restore strict fail-fast behavior.
+
+Restored checksum reads retry transient SSH and `virtctl` transport failures up
+to the existing `--ssh-timeout` limit. Remote validation failures, malformed
+checksum output, and valid checksum mismatches are not retried.
 
 `KUBECONFIG` selection uses this precedence:
 
@@ -263,6 +296,19 @@ For example, to override the environment for one invocation:
 ```
 
 Run `./scripts/harvester-csi-stress-test --help` for the complete option list.
+
+To retain only the resources from an iteration that actually fails, add:
+
+```bash
+--keep-failed-resources
+```
+
+Before cleanup, every failed iteration attempt prints its failure category, the
+final guest-readiness probe error when applicable, VM/VMI and storage YAML,
+relevant events, launcher-pod details, compute and guest serial-console logs,
+and PV/VolumeAttachment state.
+Workers terminated only because another worker failed are cleaned without
+producing additional failure bundles.
 
 ## Command-line cleanup
 
@@ -318,6 +364,9 @@ when possible.
 - Generated resources are removed by default. Enable **Keep resources** or pass
   `--keep-resources` only when retained VMs, PVCs, backups, and snapshots are
   needed for investigation.
+- Prefer **Keep only failed iteration resources** or
+  `--keep-failed-resources` for long parallel runs. It preserves the failed
+  iteration without retaining every successful iteration.
 - Use a dedicated namespace and non-production storage classes when possible;
   the test creates, snapshots, restores, formats, and deletes storage resources.
 
@@ -334,5 +383,13 @@ when possible.
   requested CPU/memory, storage classes, PVC modes, and access modes.
 - **SSH never becomes ready:** verify the image's default user, cloud-init
   support, guest interface name, DHCP, package access, and passwordless `sudo`.
+  The failure output identifies whether connectivity/authentication, required
+  guest commands, or passwordless sudo was the last incomplete stage. Use
+  `--ssh-timeout` to change the shared readiness and checksum-retry limit,
+  `--ssh-vm-retries` to retry with fresh VMs, and
+  `--keep-failed-resources` to retain the final failed attempt.
+- **Checksum retrieval reports an SSH transport failure:** increase
+  `--ssh-timeout` if the API or `virtctl` tunnel is temporarily unstable. A
+  valid checksum mismatch always fails immediately regardless of this setting.
 - **Resources remain after interruption:** use **Clean one run** in the GUI or
   `--cleanup-run RUN_ID` from the CLI.
