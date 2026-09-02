@@ -319,8 +319,20 @@ PARAMETERS = [
         "modes": ["stress"],
         "help": (
             "Total time allowed for guest SSH readiness and for retrying transient "
-            "SSH or virtctl failures while retrieving restored checksums."
+            "SSH or virtctl failures during guest payload writes and restored checksums."
         ),
+    },
+    {
+        "key": "ssh_connect_timeout",
+        "label": "SSH connect timeout",
+        "type": "number",
+        "default": 30,
+        "min": 1,
+        "suffix": "seconds",
+        "required": True,
+        "group": "Guest access",
+        "modes": ["stress"],
+        "help": "Time allowed for each SSH connection and banner exchange.",
     },
     {
         "key": "ssh_vm_retries",
@@ -575,6 +587,7 @@ def build_command(config: dict[str, Any]) -> list[str]:
             ("--snapshot-error-grace", "snapshot_error_grace"),
             ("--ssh-user", "ssh_user"),
             ("--ssh-timeout", "ssh_timeout"),
+            ("--ssh-connect-timeout", "ssh_connect_timeout"),
             ("--ssh-vm-retries", "ssh_vm_retries"),
             ("--guest-device", "guest_device"),
             ("--guest-mount-path", "guest_mount_path"),

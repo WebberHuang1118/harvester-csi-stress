@@ -45,6 +45,7 @@ DATA_SIZE_GIB=10
 ROOT_DATA_SIZE_GIB=1
 TIMEOUT_SECONDS=3600
 SSH_TIMEOUT_SECONDS=900
+SSH_CONNECT_TIMEOUT_SECONDS=30
 SSH_VM_RETRIES=0
 POLL_INTERVAL_SECONDS=5
 SNAPSHOT_ERROR_GRACE_SECONDS=60
@@ -120,7 +121,10 @@ Options:
                            Random root-disk payload size in GiB (default: 1).
   --timeout SECONDS        Timeout for each asynchronous operation (default: 3600).
   --ssh-timeout SECONDS    Total timeout for guest SSH readiness and transient
-                           restored-checksum SSH retries (default: 900).
+                           guest-operation SSH retries (default: 900).
+  --ssh-connect-timeout SECONDS
+                           Timeout for each SSH connection and banner exchange
+                           (default: 30).
   --ssh-vm-retries COUNT   Additional fresh iteration attempts after source or
                            restored VM SSH readiness times out (default: 0).
   --poll-interval SECONDS  Status polling interval (default: 5).
@@ -293,6 +297,10 @@ while (($# > 0)); do
 		SSH_TIMEOUT_SECONDS="${2:-}"
 		shift 2
 		;;
+	--ssh-connect-timeout)
+		SSH_CONNECT_TIMEOUT_SECONDS="${2:-}"
+		shift 2
+		;;
 	--ssh-vm-retries)
 		SSH_VM_RETRIES="${2:-}"
 		shift 2
@@ -408,6 +416,7 @@ else
 	require_positive_integer "--root-data-size-gib" "$ROOT_DATA_SIZE_GIB"
 	require_positive_integer "--timeout" "$TIMEOUT_SECONDS"
 	require_positive_integer "--ssh-timeout" "$SSH_TIMEOUT_SECONDS"
+	require_positive_integer "--ssh-connect-timeout" "$SSH_CONNECT_TIMEOUT_SECONDS"
 	require_non_negative_integer "--ssh-vm-retries" "$SSH_VM_RETRIES"
 	require_positive_integer "--poll-interval" "$POLL_INTERVAL_SECONDS"
 	require_non_negative_integer "--snapshot-error-grace" "$SNAPSHOT_ERROR_GRACE_SECONDS"
@@ -551,7 +560,7 @@ virtctl_ssh() {
 		--known-hosts /dev/null \
 		--local-ssh-opts="-o StrictHostKeyChecking=no" \
 		--local-ssh-opts="-o BatchMode=yes" \
-		--local-ssh-opts="-o ConnectTimeout=10" \
+		--local-ssh-opts="-o ConnectTimeout=${SSH_CONNECT_TIMEOUT_SECONDS}" \
 		--command "$command" \
 		"vm/${vm_name}"
 }
@@ -721,7 +730,7 @@ run_guest_script_with_transport_retry() {
 			fi
 			rm -f -- "$error_file"
 			if ((retry_count > 0)); then
-				log "Retrieved ${description} after ${retry_count} transient SSH retry(s)" >&2
+				log "Completed ${description} after ${retry_count} transient SSH retry(s)" >&2
 			fi
 			printf '%s\n' "$output"
 			return 0
@@ -742,7 +751,7 @@ run_guest_script_with_transport_retry() {
 			sed '/^[[:space:]]*$/d' | tail -n 1)"
 		remaining=$((deadline - SECONDS))
 		if ((remaining <= 0)); then
-			log "Unable to retrieve ${description}: transient SSH failure persisted for ${SSH_TIMEOUT_SECONDS}s" >&2
+			log "Unable to complete ${description}: transient SSH failure persisted for ${SSH_TIMEOUT_SECONDS}s" >&2
 			[[ -z "$transient_summary" ]] || log "Last SSH error: ${transient_summary}" >&2
 			rm -f -- "$error_file"
 			return 75
@@ -753,7 +762,7 @@ run_guest_script_with_transport_retry() {
 		if ((retry_delay > remaining)); then
 			retry_delay=$remaining
 		fi
-		log "Transient SSH failure retrieving ${description}; retry ${retry_count} in ${retry_delay}s (${remaining}s remaining)" >&2
+		log "Transient SSH failure during ${description}; retry ${retry_count} in ${retry_delay}s (${remaining}s remaining)" >&2
 		[[ -z "$transient_summary" ]] || log "SSH error: ${transient_summary}" >&2
 		sleep "$retry_delay"
 	done
@@ -764,15 +773,19 @@ write_root_payload() {
 	local payload_name="$2"
 	local size_mib=$((ROOT_DATA_SIZE_GIB * 1024))
 
-	run_guest_script "$vm_name" 'set -Eeuo pipefail
+	run_guest_script_with_transport_retry "source root-disk payload write" "$vm_name" 'set -Eeuo pipefail
 
 payload_directory="$1"
 payload_name="$2"
 size_mib="$3"
 
-for command in cut dd df findmnt mkdir sha256sum sync tail; do
+for command in cut dd df findmnt flock mkdir sha256sum sync tail; do
   command -v "$command" >/dev/null || { echo "required guest command not found: $command" >&2; exit 1; }
 done
+
+mkdir -p /run/lock
+exec 9>"/run/lock/csi-stress-root-payload.lock"
+flock 9
 
 mkdir -p "$payload_directory"
 mount_target="$(findmnt -rn -T "$payload_directory" -o TARGET)"
@@ -825,17 +838,21 @@ write_guest_payload() {
 	local payload_name="$2"
 	local size_mib=$((DATA_SIZE_GIB * 1024))
 
-	run_guest_script "$vm_name" 'set -Eeuo pipefail
+	run_guest_script_with_transport_retry "source data-disk payload write" "$vm_name" 'set -Eeuo pipefail
 
 device="$1"
 mount_path="$2"
 payload_name="$3"
 size_mib="$4"
 
-for command in blkid cut dd df findmnt grep head lsblk mkdir mkfs.ext4 mount mountpoint readlink sha256sum sync tail wipefs; do
+for command in blkid cut dd df findmnt flock grep head lsblk mkdir mkfs.ext4 mount mountpoint readlink sha256sum sync tail wipefs; do
   command -v "$command" >/dev/null || { echo "required guest command not found: $command" >&2; exit 1; }
 done
 test -b "$device" || { echo "guest data device is not a block device: $device" >&2; exit 1; }
+
+mkdir -p /run/lock
+exec 9>"/run/lock/csi-stress-data-payload.lock"
+flock 9
 
 device_real="$(readlink -f "$device")"
 root_source="$(findmnt -n -o SOURCE /)"
@@ -1366,7 +1383,7 @@ log "Run ID: ${RUN_ID}"
 log "Boot PVC: ${BOOT_SIZE_GIB}Gi ${BOOT_VOLUME_MODE} ${BOOT_ACCESS_MODE} on ${IMAGE_STORAGE_CLASS}"
 log "Data PVC: ${DATA_VOLUME_SIZE_GIB}Gi ${DATA_VOLUME_MODE} ${DATA_ACCESS_MODE} on ${DATA_STORAGE_CLASS}"
 log "VM network: ${NETWORK_NAME}; guest interface: ${GUEST_INTERFACE_NAME}"
-log "Timeouts: cluster operations ${TIMEOUT_SECONDS}s; snapshot error grace ${SNAPSHOT_ERROR_GRACE_SECONDS}s; guest SSH readiness/checksum retries ${SSH_TIMEOUT_SECONDS}s; fresh VM retries ${SSH_VM_RETRIES}"
+log "Timeouts: cluster operations ${TIMEOUT_SECONDS}s; snapshot error grace ${SNAPSHOT_ERROR_GRACE_SECONDS}s; guest SSH readiness/operation retries ${SSH_TIMEOUT_SECONDS}s; SSH connect ${SSH_CONNECT_TIMEOUT_SECONDS}s; fresh VM retries ${SSH_VM_RETRIES}"
 
 log "Creating VirtualMachineImage ${NAMESPACE}/${IMAGE_NAME}"
 jq -n \
