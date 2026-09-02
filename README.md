@@ -117,7 +117,7 @@ GUI exposes every supported stress-test parameter in these groups:
 - **VM network:** Multus network, guest interface name, and required node selector
 - **Workload:** iterations per worker, parallel workers, root/data payload sizes,
   polling interval, and snapshot error grace
-- **Guest access:** SSH user/key, SSH timeout, fresh-VM retries, guest
+- **Guest access:** SSH user/key, SSH retry/connect timeouts, fresh-VM retries, guest
   data device, mount path, and resource retention
 
 The image storage class is used for both the Harvester VM image and every
@@ -133,7 +133,7 @@ Important GUI and CLI defaults are:
 | --- | --- |
 | Namespace | `default` |
 | Operation timeout | `3600` seconds |
-| SSH timeout / fresh VM retries | `900` seconds / `0` |
+| SSH retry timeout / connect timeout / fresh VM retries | `900` seconds / `30` seconds / `0` |
 | vCPU / memory | `2` / `4Gi` |
 | Boot PVC | `50Gi`, `Block`, `ReadWriteOnce` |
 | Data PVC | `100Gi`, `Filesystem`, `ReadWriteOnce` |
@@ -144,7 +144,6 @@ Important GUI and CLI defaults are:
 | Root / data payload | `1Gi` / `10Gi` |
 | Polling interval | `5` seconds |
 | Snapshot error grace | `60` seconds |
-| Checksum SSH retry timeout | `60` seconds |
 | SSH user | `ubuntu` |
 | Guest data device / mount | `/dev/vdb` / `/mnt/csi-stress` |
 | Keep all resources / keep failed resources | Disabled / disabled |
@@ -255,6 +254,7 @@ NAMESPACE="default"
   --snapshot-error-grace 60 \
   --ssh-user ubuntu \
   --ssh-timeout 900 \
+  --ssh-connect-timeout 30 \
   --ssh-vm-retries 1 \
   --guest-device /dev/vdb \
   --guest-mount-path /mnt/csi-stress \
@@ -272,9 +272,12 @@ By default, a VM snapshot error may recover for up to 60 seconds before the
 iteration fails. The first error and any recovery are logged. Set
 `--snapshot-error-grace 0` to restore strict fail-fast behavior.
 
-Restored checksum reads retry transient SSH and `virtctl` transport failures up
-to the existing `--ssh-timeout` limit. Remote validation failures, malformed
-checksum output, and valid checksum mismatches are not retried.
+Source payload writes and restored checksum reads retry transient SSH and
+`virtctl` transport failures up to the `--ssh-timeout` limit. Guest writes are
+serialized so a retry cannot overlap a remote operation that survived a lost
+connection. Remote validation failures, malformed checksum output, and valid
+checksum mismatches are not retried. Use `--ssh-connect-timeout` to control the
+timeout for each individual connection and SSH banner exchange.
 
 `KUBECONFIG` selection uses this precedence:
 
@@ -385,10 +388,11 @@ when possible.
   support, guest interface name, DHCP, package access, and passwordless `sudo`.
   The failure output identifies whether connectivity/authentication, required
   guest commands, or passwordless sudo was the last incomplete stage. Use
-  `--ssh-timeout` to change the shared readiness and checksum-retry limit,
+  `--ssh-timeout` to change the shared readiness and operation-retry limit,
+  `--ssh-connect-timeout` to change each connection/banner timeout,
   `--ssh-vm-retries` to retry with fresh VMs, and
   `--keep-failed-resources` to retain the final failed attempt.
-- **Checksum retrieval reports an SSH transport failure:** increase
+- **A guest operation reports an SSH transport failure:** increase
   `--ssh-timeout` if the API or `virtctl` tunnel is temporarily unstable. A
   valid checksum mismatch always fails immediately regardless of this setting.
 - **Resources remain after interruption:** use **Clean one run** in the GUI or
