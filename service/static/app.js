@@ -19,6 +19,7 @@ const elements = {
   form: document.querySelector("#configForm"),
   modeGrid: document.querySelector("#modeGrid"),
   parameterGroups: document.querySelector("#parameterGroups"),
+  matrixPreview: document.querySelector("#matrixPreview"),
   configTitle: document.querySelector("#configTitle"),
   formError: document.querySelector("#formError"),
   startButton: document.querySelector("#startButton"),
@@ -36,6 +37,8 @@ const elements = {
   currentActivity: document.querySelector("#currentActivity"),
   commandPanel: document.querySelector("#commandPanel"),
   commandText: document.querySelector("#commandText"),
+  artifactPanel: document.querySelector("#artifactPanel"),
+  reportLink: document.querySelector("#reportLink"),
   copyCommandButton: document.querySelector("#copyCommandButton"),
   logViewport: document.querySelector("#logViewport"),
   logList: document.querySelector("#logList"),
@@ -240,6 +243,7 @@ function renderModes() {
       showFormError();
       renderModes();
       renderParameters();
+      updateMatrixPreview();
       updateStartLabel();
     });
 
@@ -274,7 +278,10 @@ function createField(parameter) {
     input.name = parameter.key;
     input.checked = Boolean(state.values[parameter.key]);
     input.disabled = state.submitting || Boolean(state.activeJobId);
-    input.addEventListener("change", () => { state.values[parameter.key] = input.checked; });
+    input.addEventListener("change", () => {
+      state.values[parameter.key] = input.checked;
+      updateMatrixPreview();
+    });
     const text = document.createElement("span");
     text.textContent = parameter.label;
     label.append(input, text);
@@ -310,9 +317,13 @@ function createField(parameter) {
   input.disabled = state.submitting || Boolean(state.activeJobId);
   input.required = Boolean(parameter.required);
   if (parameter.min !== undefined) input.min = String(parameter.min);
+  if (parameter.max !== undefined) input.max = String(parameter.max);
   if (parameter.type === "number") input.step = "1";
   if (parameter.placeholder) input.placeholder = parameter.placeholder;
-  input.addEventListener("input", () => { state.values[parameter.key] = input.value; });
+  input.addEventListener("input", () => {
+    state.values[parameter.key] = input.value;
+    updateMatrixPreview();
+  });
   inputWrap.append(input);
   if (parameter.suffix) {
     const suffix = document.createElement("span");
@@ -352,11 +363,62 @@ function renderParameters() {
     section.append(heading, fields);
     elements.parameterGroups.append(section);
   }
+  updateMatrixPreview();
+}
+
+function positiveInteger(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function updateMatrixPreview() {
+  if (state.mode !== "benchmark") {
+    elements.matrixPreview.hidden = true;
+    return;
+  }
+  const engines = String(state.values.benchmark_engines || "").split(",").filter(Boolean).length;
+  const sizes = String(state.values.benchmark_sizes_gib || "").split(",").filter((item) => /^[1-9][0-9]*$/.test(item.trim())).length;
+  const paired = positiveInteger(state.values.benchmark_paired_runs);
+  const faultRuns = positiveInteger(state.values.benchmark_fault_runs);
+  const suites = new Set(String(state.values.benchmark_suites || "").split(","));
+  const smoke = state.values.benchmark_profile === "smoke";
+  let campaigns = 0;
+  let operations = 0;
+  if (smoke) {
+    campaigns = 1;
+    operations = engines * 2;
+  } else {
+    campaigns += engines;
+    operations += engines * 2;
+    if (suites.has("capacity")) {
+      campaigns += sizes * paired;
+      operations += sizes * paired * engines * 2;
+    }
+    if (suites.has("sensitivity")) {
+      campaigns += 2 * paired;
+      operations += 2 * paired * engines * 2;
+    }
+    if (suites.has("incremental")) {
+      campaigns += paired;
+      operations += paired * 5 * engines * 2;
+    }
+    if (suites.has("cache")) {
+      campaigns += paired;
+      operations += paired * engines * 3;
+    }
+    if (state.values.benchmark_include_fault_recovery) {
+      campaigns += engines * 2 * 2 * faultRuns;
+      operations += engines * 2 * 2 * faultRuns * 2;
+    }
+  }
+  elements.matrixPreview.textContent = `Planned base workload: ${campaigns} campaigns, ${operations} backup/restore operations. Recovery retries may add operations.`;
+  elements.matrixPreview.hidden = false;
 }
 
 function updateStartLabel() {
   const labels = {
     stress: ["▶", "Start stress test"],
+    benchmark: ["▶", "Start benchmark"],
     cleanup_run: ["◆", "Clean selected run"],
     cleanup_all: ["◆", "Clean all runs"],
   };
@@ -373,7 +435,7 @@ function terminalStatus(status) {
 }
 
 function formatMode(mode) {
-  return { stress: "Stress", cleanup_run: "Cleanup run", cleanup_all: "Cleanup all" }[mode] || mode;
+  return { stress: "Stress", benchmark: "Benchmark", cleanup_run: "Cleanup run", cleanup_all: "Cleanup all" }[mode] || mode;
 }
 
 function formatStarted(timestamp) {
@@ -390,6 +452,12 @@ function renderJob(job) {
   elements.runSummary.hidden = false;
   elements.commandPanel.hidden = false;
   elements.commandText.textContent = job.command;
+  if (job.mode === "benchmark" && job.artifact_dir) {
+    elements.reportLink.href = `/api/jobs/${job.id}/artifacts/report.md`;
+    elements.artifactPanel.hidden = false;
+  } else {
+    elements.artifactPanel.hidden = true;
+  }
   elements.runIdText.textContent = job.run_id || "Pending";
   elements.startedText.textContent = formatStarted(job.started_at);
   elements.exitCodeText.textContent = job.exit_code === null ? "—" : String(job.exit_code);
@@ -429,6 +497,7 @@ function resetJobView() {
   elements.statusBadge.className = "status-badge idle";
   elements.runSummary.hidden = true;
   elements.commandPanel.hidden = true;
+  elements.artifactPanel.hidden = true;
   elements.stopButton.disabled = true;
   elements.copyLogsButton.disabled = true;
   elements.logList.replaceChildren();
@@ -664,6 +733,7 @@ async function initialize() {
     resetValues();
     renderModes();
     renderParameters();
+    updateMatrixPreview();
     updateStartLabel();
     await refreshHistory(true);
   } catch (error) {
