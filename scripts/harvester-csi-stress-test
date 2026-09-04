@@ -49,15 +49,19 @@ SSH_CONNECT_TIMEOUT_SECONDS=30
 SSH_VM_RETRIES=0
 POLL_INTERVAL_SECONDS=5
 SNAPSHOT_ERROR_GRACE_SECONDS=60
+VM_BACKUP_TYPES="snapshot"
+VM_BACKUP_TYPE_LIST=()
 KEEP_RESOURCES=false
 KEEP_FAILED_RESOURCES=false
 CLEANUP_MODE=false
 CLEANUP_RUN_ID=""
 
 RUN_ID=""
+RUN_TOKEN=""
 IMAGE_NAME=""
 CURRENT_VM=""
 CURRENT_BACKUP=""
+CURRENT_BACKUP_TYPE=""
 CURRENT_RESTORE=""
 CURRENT_RESTORED_VM=""
 CURRENT_ITERATION=""
@@ -95,7 +99,7 @@ Required arguments:
                            StorageClass for the data PVC.
   --cpu COUNT              Positive integer vCPU count for each test VM.
   --memory QUANTITY        Kubernetes memory quantity, for example 4Gi.
-  --iterations COUNT       Snapshot/restore iterations run by each worker.
+  --iterations COUNT       Backup/restore iterations run by each worker.
 
 Options:
   --namespace NAME         Namespace for all namespaced resources (default: default).
@@ -129,9 +133,13 @@ Options:
                            restored VM SSH readiness times out (default: 0).
   --poll-interval SECONDS  Status polling interval (default: 5).
   --snapshot-error-grace SECONDS
-                           Continue waiting this long after a VM snapshot reports
+                           Continue waiting this long after a VM backup reports
                            an error so controller retries can recover (default: 60;
                            use 0 for fail-fast behavior).
+  --vm-backup-types TYPES  VirtualMachineBackup type: snapshot, backup, restic, or
+                           kopia (default: snapshot). Supply two comma-separated,
+                           distinct types to alternate them between iterations,
+                           for example restic,kopia.
   --ssh-user USER          Cloud image's default SSH user (default: ubuntu).
   --ssh-identity-file PATH Existing unencrypted private key to inject and use.
                            By default, the script generates an ephemeral key.
@@ -146,7 +154,7 @@ Options:
 
 The script creates a minimal KubeVirt VM manifest and VMImage for each run. For
 example, --iterations 10 --parallel 3 starts three concurrent workers. Each
-worker runs ten VM, snapshot, restore, and integrity-check cycles (30 total).
+worker runs ten VM backup, restore, and integrity-check cycles (30 total).
 Parallel execution requires Bash 5.1 or newer.
 
 Cloud-init configures DHCP on --guest-interface-name and installs
@@ -313,6 +321,10 @@ while (($# > 0)); do
 		SNAPSHOT_ERROR_GRACE_SECONDS="${2:-}"
 		shift 2
 		;;
+	--vm-backup-types)
+		VM_BACKUP_TYPES="${2:-}"
+		shift 2
+		;;
 	--guest-device)
 		GUEST_DEVICE="${2:-}"
 		shift 2
@@ -371,7 +383,7 @@ else
 	if ((BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1))); then
 		fail "stress-test mode requires Bash 5.1 or newer"
 	fi
-	for required_command in kubectl jq virtctl base64 ssh-keygen; do
+	for required_command in kubectl jq virtctl base64 sha256sum ssh-keygen; do
 		command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: ${required_command}"
 	done
 
@@ -420,12 +432,23 @@ else
 	require_non_negative_integer "--ssh-vm-retries" "$SSH_VM_RETRIES"
 	require_positive_integer "--poll-interval" "$POLL_INTERVAL_SECONDS"
 	require_non_negative_integer "--snapshot-error-grace" "$SNAPSHOT_ERROR_GRACE_SECONDS"
+	[[ "$VM_BACKUP_TYPES" =~ ^(snapshot|backup|restic|kopia)(,(snapshot|backup|restic|kopia))?$ ]] ||
+		fail "--vm-backup-types must contain one or two comma-separated values from: snapshot, backup, restic, kopia"
+	IFS=',' read -r -a VM_BACKUP_TYPE_LIST <<<"$VM_BACKUP_TYPES"
+	if ((${#VM_BACKUP_TYPE_LIST[@]} == 2)); then
+		[[ "${VM_BACKUP_TYPE_LIST[0]}" != "${VM_BACKUP_TYPE_LIST[1]}" ]] ||
+			fail "--vm-backup-types values must be distinct when two types are supplied"
+	fi
 	((ROOT_DATA_SIZE_GIB < BOOT_SIZE_GIB)) ||
 		fail "--root-data-size-gib must be smaller than --boot-size-gib"
 	((DATA_SIZE_GIB < DATA_VOLUME_SIZE_GIB)) ||
 		fail "--data-size-gib must be smaller than --data-volume-size-gib"
 
 	RUN_ID="$(resource_name "csi-stress-$(date -u +%Y%m%d%H%M%S)-${RANDOM}")"
+	# Remote engines embed the backup and PVC names in helper Job names and labels.
+	# Use a compact, run-unique token so those derived values stay below 63 bytes.
+	read -r run_hash _ < <(printf '%s' "$RUN_ID" | sha256sum)
+	RUN_TOKEN="s${run_hash:0:8}"
 	IMAGE_NAME="$(resource_name "${RUN_ID}-image")"
 	STRESS_TMP_DIR="$(mktemp -d)"
 
@@ -1153,11 +1176,40 @@ cleanup_old_runs() {
 clear_iteration_state() {
 	CURRENT_VM=""
 	CURRENT_BACKUP=""
+	CURRENT_BACKUP_TYPE=""
 	CURRENT_RESTORE=""
 	CURRENT_RESTORED_VM=""
 	CURRENT_ITERATION=""
 	CURRENT_BOOT_PVC=""
 	CURRENT_DIAGNOSTICS_COLLECTED=false
+}
+
+vm_backup_type_for_iteration() {
+	local worker="$1"
+	local iteration="$2"
+	local type_index=$(((worker + iteration - 2) % ${#VM_BACKUP_TYPE_LIST[@]}))
+
+	printf '%s\n' "${VM_BACKUP_TYPE_LIST[$type_index]}"
+}
+
+validate_remote_engine_names() {
+	local data_pvc_name="$1"
+	local derived_name=""
+	local pvc_name=""
+
+	case "$CURRENT_BACKUP_TYPE" in
+	restic | kopia) ;;
+	*) return 0 ;;
+	esac
+
+	for pvc_name in "$CURRENT_BOOT_PVC" "$data_pvc_name"; do
+		derived_name="${CURRENT_BACKUP_TYPE}-backup-${CURRENT_BACKUP}-volume-${pvc_name}"
+		((${#derived_name} <= 63)) ||
+			fail "generated remote backup helper name exceeds 63 bytes: ${derived_name}"
+	done
+	derived_name="${CURRENT_BACKUP_TYPE}-restore-${CURRENT_RESTORE}-${DATA_VOLUME_NAME}"
+	((${#derived_name} <= 63)) ||
+		fail "generated remote restore helper name exceeds 63 bytes: ${derived_name}"
 }
 
 cleanup_iteration() {
@@ -1383,7 +1435,8 @@ log "Run ID: ${RUN_ID}"
 log "Boot PVC: ${BOOT_SIZE_GIB}Gi ${BOOT_VOLUME_MODE} ${BOOT_ACCESS_MODE} on ${IMAGE_STORAGE_CLASS}"
 log "Data PVC: ${DATA_VOLUME_SIZE_GIB}Gi ${DATA_VOLUME_MODE} ${DATA_ACCESS_MODE} on ${DATA_STORAGE_CLASS}"
 log "VM network: ${NETWORK_NAME}; guest interface: ${GUEST_INTERFACE_NAME}"
-log "Timeouts: cluster operations ${TIMEOUT_SECONDS}s; snapshot error grace ${SNAPSHOT_ERROR_GRACE_SECONDS}s; guest SSH readiness/operation retries ${SSH_TIMEOUT_SECONDS}s; SSH connect ${SSH_CONNECT_TIMEOUT_SECONDS}s; fresh VM retries ${SSH_VM_RETRIES}"
+log "VM backup types: ${VM_BACKUP_TYPES}"
+log "Timeouts: cluster operations ${TIMEOUT_SECONDS}s; VM backup error grace ${SNAPSHOT_ERROR_GRACE_SECONDS}s; guest SSH readiness/operation retries ${SSH_TIMEOUT_SECONDS}s; SSH connect ${SSH_CONNECT_TIMEOUT_SECONDS}s; fresh VM retries ${SSH_VM_RETRIES}"
 
 log "Creating VirtualMachineImage ${NAMESPACE}/${IMAGE_NAME}"
 jq -n \
@@ -1456,8 +1509,8 @@ create_iteration_vm() {
 		--arg cloudInitNetworkData "$CLOUD_INIT_NETWORK_DATA" \
 		--arg memory "$MEMORY" \
 		--argjson cpu "$CPU" '
-    ($vm + "-pvc-0") as $bootPVC
-    | ($vm + "-pvc-1") as $dataPVC
+    ($vm + "-p0") as $bootPVC
+    | ($vm + "-p1") as $dataPVC
     | [
         {
           metadata: {
@@ -1588,6 +1641,7 @@ run_iteration() {
 	local attempt="${3:-1}"
 	local max_attempts=$((SSH_VM_RETRIES + 1))
 	local attempt_suffix=""
+	local object_attempt_suffix=""
 	local iteration_id=""
 	local VM_JSON=""
 	local DATA_PVC_NAME=""
@@ -1602,16 +1656,19 @@ run_iteration() {
 
 	if ((attempt > 1)); then
 		attempt_suffix="-a${attempt}"
+		object_attempt_suffix="a${attempt}"
 	fi
 	iteration_id="worker-${worker}-iteration-${iteration}${attempt_suffix}"
 	CURRENT_ITERATION="$iteration_id"
-	CURRENT_VM="$(resource_name "${RUN_ID}-worker-${worker}-vm-${iteration}${attempt_suffix}")"
-	CURRENT_BACKUP="$(resource_name "${RUN_ID}-worker-${worker}-snapshot-${iteration}${attempt_suffix}")"
-	CURRENT_RESTORE="$(resource_name "${RUN_ID}-worker-${worker}-restore-${iteration}${attempt_suffix}")"
-	CURRENT_RESTORED_VM="$(resource_name "${RUN_ID}-worker-${worker}-restored-${iteration}${attempt_suffix}")"
+	CURRENT_VM="$(resource_name "${RUN_TOKEN}w${worker}v${iteration}${object_attempt_suffix}")"
+	CURRENT_BACKUP="$(resource_name "${RUN_TOKEN}w${worker}b${iteration}${object_attempt_suffix}")"
+	CURRENT_BACKUP_TYPE="$(vm_backup_type_for_iteration "$worker" "$iteration")"
+	CURRENT_RESTORE="$(resource_name "${RUN_TOKEN}w${worker}r${iteration}${object_attempt_suffix}")"
+	CURRENT_RESTORED_VM="$(resource_name "${RUN_TOKEN}w${worker}n${iteration}${object_attempt_suffix}")"
 	VM_JSON="${STRESS_TMP_DIR}/worker-${worker}-vm-${iteration}${attempt_suffix}.json"
-	CURRENT_BOOT_PVC="${CURRENT_VM}-pvc-${BOOT_TEMPLATE_INDEX}"
-	DATA_PVC_NAME="${CURRENT_VM}-pvc-${DATA_TEMPLATE_INDEX}"
+	CURRENT_BOOT_PVC="${CURRENT_VM}-p${BOOT_TEMPLATE_INDEX}"
+	DATA_PVC_NAME="${CURRENT_VM}-p${DATA_TEMPLATE_INDEX}"
+	validate_remote_engine_names "$DATA_PVC_NAME"
 	ROOT_PAYLOAD_NAME=".csi-stress-${RUN_ID}-${iteration_id}-root.bin"
 	DATA_PAYLOAD_NAME=".csi-stress-${RUN_ID}-${iteration_id}-data.bin"
 	CURRENT_FAILURE_CATEGORY="vm-creation-failure"
@@ -1652,14 +1709,15 @@ run_iteration() {
 		fail "invalid source data-disk checksum: ${DATA_SOURCE_CHECKSUM@Q}"
 	log "Source data-disk checksum: ${DATA_SOURCE_CHECKSUM}"
 
-	CURRENT_FAILURE_CATEGORY="snapshot-failure"
-	log "Creating VM snapshot ${NAMESPACE}/${CURRENT_BACKUP}"
+	CURRENT_FAILURE_CATEGORY="backup-failure"
+	log "Creating VM backup ${NAMESPACE}/${CURRENT_BACKUP} with type ${CURRENT_BACKUP_TYPE}"
 	jq -n \
 		--arg namespace "$NAMESPACE" \
 		--arg name "$CURRENT_BACKUP" \
 		--arg vm "$CURRENT_VM" \
 		--arg run "$RUN_ID" \
 		--arg iteration "$iteration_id" \
+		--arg backupType "$CURRENT_BACKUP_TYPE" \
 		--arg runLabel "$STRESS_RUN_LABEL" \
 		--arg iterationLabel "$STRESS_ITERATION_LABEL" '
       {
@@ -1673,12 +1731,12 @@ run_iteration() {
         },
         spec: {
           source: {apiGroup: "kubevirt.io", kind: "VirtualMachine", name: $vm},
-          type: "snapshot"
+          type: $backupType
         }
       }
-	    ' | kubectl apply -f - >/dev/null
+    ' | kubectl apply -f - >/dev/null
 	wait_for_resource virtualmachinebackups.harvesterhci.io "$CURRENT_BACKUP" \
-		'.status.readyToUse == true' "VM snapshot" '.status.error.message? != null' \
+		'.status.readyToUse == true' "VM backup (${CURRENT_BACKUP_TYPE})" '.status.error.message? != null' \
 		"$SNAPSHOT_ERROR_GRACE_SECONDS"
 
 	CURRENT_FAILURE_CATEGORY="source-vm-stop-failure"
@@ -1688,7 +1746,7 @@ run_iteration() {
 	wait_for_launcher_absent "$CURRENT_VM"
 
 	CURRENT_FAILURE_CATEGORY="restore-failure"
-	log "Restoring snapshot ${CURRENT_BACKUP} to VM ${CURRENT_RESTORED_VM}"
+	log "Restoring ${CURRENT_BACKUP_TYPE} backup ${CURRENT_BACKUP} to VM ${CURRENT_RESTORED_VM}"
 	jq -n \
 		--arg namespace "$NAMESPACE" \
 		--arg name "$CURRENT_RESTORE" \

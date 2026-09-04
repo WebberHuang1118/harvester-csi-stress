@@ -1,7 +1,8 @@
 # Harvester CSI Stress Test
 
-This repository tests Harvester VM snapshot and restore workflows against a CSI
-storage driver. It can be operated from the command line or from a local web GUI.
+This repository tests Harvester VM backup and restore workflows against a CSI
+storage driver. Backups can use local CSI snapshots or a configured remote backup
+target. The test can be operated from the command line or from a local web GUI.
 
 The test imports one Harvester `VirtualMachineImage` for the run, starts the
 requested number of workers in parallel, and performs the configured number of
@@ -16,9 +17,10 @@ During each iteration, the test:
    VMs.
 3. Writes random payloads to the root filesystem and data disk and records their
    SHA-256 checksums.
-4. Creates a Harvester `VirtualMachineBackup` with filesystem freeze enabled.
-   Transient snapshot errors remain visible in the log, but the test allows a
-   bounded recovery window for the snapshot controller's automatic retries.
+4. Creates a Harvester `VirtualMachineBackup` with filesystem freeze enabled,
+   using the configured `snapshot`, `backup`, `restic`, or `kopia` type. Two
+   configured types alternate between iterations. Transient errors remain visible
+   in the log, but the test allows a bounded recovery window for controller retries.
 5. Stops the source VM and restores the backup as a new VM.
 6. Recalculates both checksums on the restored VM and verifies data integrity.
    Checksum retrieval retries transient SSH/`virtctl` transport failures
@@ -44,6 +46,8 @@ Run the CLI or GUI service from a host that has:
 - A CSI-backed image storage class that supports the selected boot PVC settings
 - A CSI-backed data storage class that supports the selected data PVC settings
   and snapshots
+- For `backup`, `restic`, or `kopia`, a working Harvester backup target with the
+  corresponding backup engine configured
 - A Multus `NetworkAttachmentDefinition` reachable by the test VMs
 
 The cloud image must support cloud-init, the selected SSH user, passwordless
@@ -115,8 +119,8 @@ GUI exposes every supported stress-test parameter in these groups:
 - **VM and storage:** image URL, image/data storage classes, CPU, memory, PVC
   capacities, volume modes, and access modes
 - **VM network:** Multus network, guest interface name, and required node selector
-- **Workload:** iterations per worker, parallel workers, root/data payload sizes,
-  polling interval, and snapshot error grace
+- **Workload:** iterations per worker, parallel workers, VM backup type(s),
+  root/data payload sizes, polling interval, and backup error grace
 - **Guest access:** SSH user/key, SSH retry/connect timeouts, fresh-VM retries, guest
   data device, mount path, and resource retention
 
@@ -141,9 +145,10 @@ Important GUI and CLI defaults are:
 | Guest interface | `enp1s0` |
 | Required node selector | `network.harvesterhci.io/mgmt=true` |
 | Iterations / parallel workers | `1` / `1` |
+| VM backup type(s) | `snapshot` |
 | Root / data payload | `1Gi` / `10Gi` |
 | Polling interval | `5` seconds |
-| Snapshot error grace | `60` seconds |
+| VM backup error grace | `60` seconds |
 | SSH user | `ubuntu` |
 | Guest data device / mount | `/dev/vdb` / `/mnt/csi-stress` |
 | Keep all resources / keep failed resources | Disabled / disabled |
@@ -248,6 +253,7 @@ NAMESPACE="default"
   --node-selector network.harvesterhci.io/mgmt=true \
   --iterations 3 \
   --parallel 2 \
+  --vm-backup-types restic,kopia \
   --root-data-size-gib 1 \
   --data-size-gib 10 \
   --poll-interval 5 \
@@ -263,12 +269,14 @@ NAMESPACE="default"
 ```
 
 This example runs two workers concurrently, with three iterations per worker,
-for six snapshot/restore and integrity-check cycles in total. Iterations within
-one worker are sequential. If source or restored VM guest readiness exceeds 15
-minutes, that logical iteration is retried once with newly created VMs. Set
-`--ssh-vm-retries 0` to disable retries.
+for six backup/restore and integrity-check cycles in total. Each worker alternates
+between `restic` and `kopia`; workers are offset so concurrent iterations exercise
+both types. Iterations within one worker are sequential. If source or restored VM
+guest readiness exceeds 15 minutes, that logical iteration is retried once with
+newly created VMs and the same backup type. Set `--ssh-vm-retries 0` to disable
+retries.
 
-By default, a VM snapshot error may recover for up to 60 seconds before the
+By default, a VM backup error may recover for up to 60 seconds before the
 iteration fails. The first error and any recovery are logged. Set
 `--snapshot-error-grace 0` to restore strict fail-fast behavior.
 
@@ -349,7 +357,8 @@ when possible.
   smaller than the PVC, and the root disk must also have room for the guest OS,
   packages, logs, and filesystem metadata.
 - Capacity usage scales with `--parallel` because every worker can have a source
-  VM, snapshots, and restored storage at the same time.
+  VM, backup artifacts, and restored storage at the same time. Remote backups also
+  consume capacity on the configured backup target.
 - The data disk is formatted as ext4 inside the guest when it has no existing
   filesystem signature. The script refuses to format the root device or a disk
   with an unexpected signature.
@@ -371,7 +380,7 @@ when possible.
   `--keep-failed-resources` for long parallel runs. It preserves the failed
   iteration without retaining every successful iteration.
 - Use a dedicated namespace and non-production storage classes when possible;
-  the test creates, snapshots, restores, formats, and deletes storage resources.
+  the test creates, backs up, restores, formats, and deletes storage resources.
 
 ## Troubleshooting
 

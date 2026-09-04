@@ -32,7 +32,7 @@ MODES = [
     {
         "value": "stress",
         "label": "Stress test",
-        "description": "Create VMs, snapshot and restore them, then verify disk data.",
+        "description": "Create VMs, back up and restore them, then verify disk data.",
     },
     {
         "value": "cleanup_run",
@@ -251,6 +251,31 @@ PARAMETERS = [
         "help": "Workers run concurrently; iterations within one worker run sequentially.",
     },
     {
+        "key": "vm_backup_types",
+        "label": "VM backup type(s)",
+        "type": "select",
+        "options": [
+            "snapshot",
+            "backup",
+            "restic",
+            "kopia",
+            "snapshot,backup",
+            "snapshot,restic",
+            "snapshot,kopia",
+            "backup,restic",
+            "backup,kopia",
+            "restic,kopia",
+        ],
+        "default": "snapshot",
+        "required": True,
+        "group": "Workload",
+        "modes": ["stress"],
+        "help": (
+            "Use one type for every iteration, or a comma-separated pair to alternate "
+            "between them. Remote types require a working Harvester backup target."
+        ),
+    },
+    {
         "key": "data_size_gib",
         "label": "Data-disk payload",
         "type": "number",
@@ -285,7 +310,7 @@ PARAMETERS = [
     },
     {
         "key": "snapshot_error_grace",
-        "label": "Snapshot error grace",
+        "label": "VM backup error grace",
         "type": "number",
         "default": 60,
         "min": 0,
@@ -294,7 +319,7 @@ PARAMETERS = [
         "group": "Workload",
         "modes": ["stress"],
         "help": (
-            "Continue waiting after a VM snapshot reports an error so controller "
+            "Continue waiting after a VM backup reports an error so controller "
             "retries can recover. Set to 0 for fail-fast behavior."
         ),
     },
@@ -528,7 +553,13 @@ def normalize_config(payload: Any) -> dict[str, Any]:
     if mode == "stress":
         if config["keep_resources"] and config["keep_failed_resources"]:
             raise ConfigError("Keep resources and keep only failed iteration resources cannot both be enabled")
-        for key in ("boot_volume_mode", "data_volume_mode", "boot_access_mode", "data_access_mode"):
+        for key in (
+            "boot_volume_mode",
+            "data_volume_mode",
+            "boot_access_mode",
+            "data_access_mode",
+            "vm_backup_types",
+        ):
             options = PARAMETER_BY_KEY[key]["options"]
             if config[key] not in options:
                 raise ConfigError(f"{PARAMETER_BY_KEY[key]['label']} must be one of: {', '.join(options)}")
@@ -581,6 +612,7 @@ def build_command(config: dict[str, Any]) -> list[str]:
             ("--node-selector", "node_selector"),
             ("--iterations", "iterations"),
             ("--parallel", "parallel"),
+            ("--vm-backup-types", "vm_backup_types"),
             ("--data-size-gib", "data_size_gib"),
             ("--root-data-size-gib", "root_data_size_gib"),
             ("--poll-interval", "poll_interval"),
