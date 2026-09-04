@@ -35,6 +35,7 @@
             <div class="mode-grid" id="modeGrid"></div>
           </fieldset>
           <div id="parameterGroups"></div>
+          <div class="matrix-preview" id="matrixPreview" hidden></div>
           <div class="form-error" id="formError" role="alert" hidden></div>
           <div class="action-row">
             <button class="primary-button" id="startButton" type="submit">
@@ -96,6 +97,11 @@
             <button class="copy-button" id="copyCommandButton" type="button">Copy</button>
           </div>
         </details>
+
+        <div class="artifact-panel" id="artifactPanel" hidden>
+          <strong>Durable benchmark report</strong>
+          <a id="reportLink" href="#" download>Download report.md</a>
+        </div>
 
         <div class="log-toolbar">
           <div class="filter-group" id="levelFilters" aria-label="Log filters">

@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""CLI entrypoint for the Harvester Restic/Kopia benchmark."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from benchmark.model import BenchmarkConfig, NORMAL_SUITES, parse_csv, parse_sizes  # noqa: E402
+from benchmark.runner import BenchmarkRunner  # noqa: E402
+
+
+def default_kubeconfig() -> str:
+    configured = os.environ.get("KUBECONFIG", "")
+    if configured:
+        return configured
+    candidate = Path("/home/webber/.kube/95.yaml")
+    return str(candidate) if candidate.is_file() else ""
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Benchmark Harvester Restic and Kopia VMBackup/VMRestore implementations."
+    )
+    result.add_argument("--profile", choices=("smoke", "standard", "custom"), default="standard")
+    result.add_argument("--kubeconfig", default=default_kubeconfig())
+    result.add_argument("--namespace", default="default")
+    result.add_argument("--image-url", default="")
+    result.add_argument("--image-storage-class", default="lvm-95-thin")
+    result.add_argument("--data-storage-class", default="lvm-95-thin")
+    result.add_argument("--snapshot-class", default="lvm-snapshot")
+    result.add_argument("--sizes-gib", default="10,20,30", help="Comma-separated data-device capacities")
+    result.add_argument("--paired-runs", type=int, default=5)
+    result.add_argument("--fault-runs", type=int, default=3)
+    result.add_argument("--include-fault-recovery", action="store_true")
+    result.add_argument("--suites", default=",".join(NORMAL_SUITES))
+    result.add_argument("--engines", default="restic,kopia")
+    result.add_argument("--seed", default="harvester-vmbackup-benchmark-v1")
+    result.add_argument("--output-dir", default=str(ROOT / "results"))
+    result.add_argument("--cpu", type=int, default=2)
+    result.add_argument("--memory", default="4Gi")
+    result.add_argument("--boot-size-gib", type=int, default=50)
+    result.add_argument("--network-name", default="default/mgmt-vlan")
+    result.add_argument("--guest-interface-name", default="enp1s0")
+    result.add_argument("--node-selector", default="network.harvesterhci.io/mgmt=true")
+    result.add_argument("--ssh-user", default="ubuntu")
+    result.add_argument("--ssh-identity-file", default="")
+    result.add_argument("--guest-device", default="/dev/vdb")
+    result.add_argument("--operation-timeout", type=int, default=3600)
+    result.add_argument("--ssh-timeout", type=int, default=900)
+    result.add_argument("--poll-interval", type=int, default=1)
+    result.add_argument("--cooldown", type=int, default=60)
+    result.add_argument("--s3-pause-seconds", type=int, default=60)
+    result.add_argument("--fault-progress-percent", type=int, default=30)
+    result.add_argument(
+        "--delete-backups",
+        action="store_true",
+        help="Delete benchmark VMBackup CRs after reporting (retained by default).",
+    )
+    result.add_argument("--dry-run", action="store_true", help="Expand the matrix and write artifacts without changing the cluster")
+    result.add_argument(
+        "--cleanup-run",
+        metavar="RUN_ID",
+        help="Explicitly delete Kubernetes objects labeled with this benchmark run ID, including retained backups",
+    )
+    return result
+
+
+def cleanup_run(arguments: argparse.Namespace) -> int:
+    if not arguments.cleanup_run or not arguments.cleanup_run.startswith("vmbr-"):
+        raise SystemExit("--cleanup-run requires a benchmark run ID beginning with vmbr-")
+    environment = os.environ.copy()
+    if arguments.kubeconfig:
+        environment["KUBECONFIG"] = arguments.kubeconfig
+    selector = f"benchmark.harvesterhci.io/run={arguments.cleanup_run}"
+    resources = (
+        "virtualmachinerestores.harvesterhci.io",
+        "virtualmachinebackups.harvesterhci.io",
+        "virtualmachines.kubevirt.io",
+        "virtualmachineimages.harvesterhci.io",
+        "persistentvolumeclaims",
+        "networkpolicies.networking.k8s.io",
+    )
+    print(f"Deleting benchmark resources selected by {selector!r} in {arguments.namespace}")
+    for resource in resources:
+        subprocess.run(
+            ["kubectl", "delete", resource, "-n", arguments.namespace, "-l", selector, "--ignore-not-found"],
+            env=environment,
+            check=False,
+        )
+    return 0
+
+
+def config_from_arguments(arguments: argparse.Namespace) -> BenchmarkConfig:
+    try:
+        sizes = parse_sizes(arguments.sizes_gib)
+        suites = parse_csv(arguments.suites, name="suites")
+        engines = parse_csv(arguments.engines, name="engines")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    return BenchmarkConfig(
+        profile=arguments.profile,
+        kubeconfig=arguments.kubeconfig,
+        namespace=arguments.namespace,
+        image_url=arguments.image_url,
+        image_storage_class=arguments.image_storage_class,
+        data_storage_class=arguments.data_storage_class,
+        snapshot_class=arguments.snapshot_class,
+        sizes_gib=sizes,
+        paired_runs=arguments.paired_runs,
+        fault_runs=arguments.fault_runs,
+        include_fault_recovery=arguments.include_fault_recovery,
+        suites=suites,
+        engines=engines,
+        seed=arguments.seed,
+        output_dir=arguments.output_dir,
+        cpu=arguments.cpu,
+        memory=arguments.memory,
+        boot_size_gib=arguments.boot_size_gib,
+        network_name=arguments.network_name,
+        guest_interface_name=arguments.guest_interface_name,
+        node_selector=arguments.node_selector,
+        ssh_user=arguments.ssh_user,
+        ssh_identity_file=arguments.ssh_identity_file,
+        guest_device=arguments.guest_device,
+        operation_timeout=arguments.operation_timeout,
+        ssh_timeout=arguments.ssh_timeout,
+        poll_interval=arguments.poll_interval,
+        cooldown=arguments.cooldown,
+        s3_pause_seconds=arguments.s3_pause_seconds,
+        fault_progress_percent=arguments.fault_progress_percent,
+        keep_backups=not arguments.delete_backups,
+        dry_run=arguments.dry_run,
+    )
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    if arguments.cleanup_run:
+        return cleanup_run(arguments)
+    config = config_from_arguments(arguments)
+    try:
+        config.validate()
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    return BenchmarkRunner(config).run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

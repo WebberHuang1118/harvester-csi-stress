@@ -1,7 +1,8 @@
 # Harvester CSI Stress Test
 
-This repository tests Harvester VM snapshot and restore workflows against a CSI
-storage driver. It can be operated from the command line or from a local web GUI.
+This repository tests Harvester VM backup and restore workflows against a CSI
+storage driver. Backups can use local CSI snapshots or a configured remote backup
+target. The test can be operated from the command line or from a local web GUI.
 
 The test imports one Harvester `VirtualMachineImage` for the run, starts the
 requested number of workers in parallel, and performs the configured number of
@@ -17,9 +18,10 @@ During each iteration, the test:
    VMs. A CDI clone source HTTP 401 gets its own fresh-iteration retry budget.
 3. Writes random payloads to the root filesystem and every data disk and records
    their SHA-256 checksums.
-4. Creates a Harvester `VirtualMachineBackup` with filesystem freeze enabled.
-   Transient snapshot errors remain visible in the log, but the test allows a
-   bounded recovery window for the snapshot controller's automatic retries.
+4. Creates a Harvester `VirtualMachineBackup` with filesystem freeze enabled,
+   using the configured `snapshot`, `backup`, `restic`, or `kopia` type. Two
+   configured types alternate between iterations. Transient errors remain visible
+   in the log, but the test allows a bounded recovery window for controller retries.
 5. Stops the source VM and restores the backup as a new VM.
 6. Recalculates every checksum on the restored VM and verifies data integrity.
    Checksum retrieval retries transient SSH/`virtctl` transport failures
@@ -45,6 +47,8 @@ Run the CLI or GUI service from a host that has:
 - A CSI-backed image storage class that supports the selected boot PVC settings
 - A CSI-backed data storage class that supports the selected data PVC settings
   and snapshots
+- For `backup`, `restic`, or `kopia`, a working Harvester backup target with the
+  corresponding backup engine configured
 - A Multus `NetworkAttachmentDefinition` reachable by the test VMs
 
 The cloud image must support cloud-init, the selected SSH user, passwordless
@@ -197,8 +201,9 @@ GUI exposes every supported stress-test parameter in these groups:
 - **VM and storage:** image URL, image/data storage classes, CPU, memory, data
   disk count, PVC capacities, volume modes, and access modes
 - **VM network:** Multus network, guest interface name, and required node selector
-- **Workload:** iterations per worker, parallel workers, root/data payload sizes,
-  polling interval, snapshot error grace, and CDI clone authentication retries
+- **Workload:** iterations per worker, parallel workers, VM backup type(s),
+  root/data payload sizes, polling interval, backup error grace, and CDI clone
+  authentication retries
 - **Guest access:** SSH user/key, SSH retry/connect timeouts, fresh-VM retries, guest
   data device, mount path, and resource retention
 
@@ -223,9 +228,10 @@ Important GUI and CLI defaults are:
 | Guest interface | `enp1s0` |
 | Required node selector | `network.harvesterhci.io/mgmt=true` |
 | Iterations / parallel workers | `1` / `1` |
+| VM backup type(s) | `snapshot` |
 | Root / per-data-disk payload | `1Gi` / `10Gi` |
 | Polling interval | `5` seconds |
-| Snapshot error grace | `60` seconds |
+| VM backup error grace | `60` seconds |
 | CDI clone authentication retries | `1` |
 | SSH user | `ubuntu` |
 | Single data-disk device / mount | `/dev/vdb` / `/mnt/csi-stress` |
@@ -302,6 +308,200 @@ The GUI also provides two cleanup modes:
 
 Prefer single-run cleanup when the run ID is known.
 
+## Restic and Kopia benchmark
+
+The benchmark is separate from the stress test. It executes matched Restic and
+Kopia VMBackup/VMRestore campaigns, collects performance and repository metrics,
+checks restored data, and writes a durable report for each run.
+
+Use a dedicated, non-production namespace and backup repository. In addition to
+the general prerequisites above, the benchmark currently requires:
+
+- An S3 Harvester backup target that the machine running the benchmark can
+  reach directly
+- Restic and Kopia enabled and supported by the cluster's
+  `VirtualMachineBackup` CRD
+- A valid `VolumeSnapshotClass`
+- No other active Restic or Kopia backup jobs during the benchmark
+- Kopia garbage collection disabled for the duration of measured campaigns
+- For the optional fault suite, a dedicated namespace with no existing
+  `NetworkPolicy` resources
+
+### Run from the GUI
+
+Start the service as described under **Browser GUI**, then:
+
+1. Select **Restic/Kopia benchmark**.
+2. Enter the image URL, storage classes, snapshot class, network, and guest
+   settings for the test cluster.
+3. Keep **Dry run** enabled for the first launch. Review the expanded matrix in
+   the GUI and the generated report without changing the cluster.
+4. Disable **Dry run**, select the **smoke** profile, and start one small
+   end-to-end validation. Smoke runs one size with both selected engines: one
+   backup and one restore per engine.
+5. Check the live output and open **Download report.md** after completion.
+6. After the smoke result is valid, select **standard** or **custom**, configure
+   the suites and paired-run count, and start the measured run.
+7. Enable **Include fault-recovery suite** only when fault injection is wanted.
+   Restored-data correctness checks remain enabled even when this suite is off.
+
+The standard defaults are substantial: 37 campaigns and 234 backup/restore
+operations, including excluded warm-ups but not the optional fault suite. They
+also include a 60-second cooldown after measured campaigns. Check the matrix
+preview and available VM, storage, repository, and maintenance-window capacity
+before starting.
+
+### How campaigns become operations
+
+An operation is one `VirtualMachineBackup` or one `VirtualMachineRestore`.
+For example, selecting one 20 GiB data-device size, one paired run, both
+engines, and all normal suites expands to seven campaigns and 42 operations:
+
+| Suite | Campaigns | Operations |
+|---|---:|---:|
+| Warm-up | 2 | 4 |
+| Capacity | 1 | 4 |
+| Sensitivity | 2 | 8 |
+| Incremental, 5 generations | 1 | 20 |
+| Cache, 2 restores per engine | 1 | 6 |
+| **Total** | **7** | **42** |
+
+The operation counts expand as follows:
+
+- **Warm-up:** one excluded, unmeasured campaign per engine. Each engine runs
+  one backup and one restore: `2 engines * 2 operations = 4`.
+- **Capacity:** both engines each run one backup and one restore:
+  `1 campaign * 2 engines * 2 operations = 4`.
+- **Sensitivity:** separate compressible and random campaigns each exercise
+  both engines: `2 campaigns * 2 engines * 2 operations = 8`.
+- **Incremental:** the source passes through G0 initial data, G1 0% changed,
+  G2 1% changed, G3 10% changed, and G4 100% changed. Each generation runs one
+  backup and one restore with both engines:
+  `5 generations * 2 engines * 2 operations = 20`.
+- **Cache:** each engine creates one backup followed by two sequential restores:
+  `2 engines * (1 backup + 2 restores) = 6`.
+
+Campaigns, engines, and restores execute sequentially. Therefore, the 42
+operations increase total runtime and remote-repository consumption, but do not
+multiply the peak live LVM PVC requirement. With a 10 GiB root disk and 20 GiB
+data disk, the peak live VM PVC capacity is approximately 60 GiB plus the shared
+imported-image volume: 30 GiB for the stopped source VM and 30 GiB for the one
+restored VM. At most two VM objects coexist, and only one VM runs at a time.
+
+This matrix creates about 20 `VirtualMachineBackup` objects. They and their
+remote repository data are retained by default, while source VMs, restored VMs,
+and their PVCs are removed as the run advances. The completed smoke validation
+also showed that ready remote backups did not retain local `VolumeSnapshot`
+objects, so retained backups primarily consume backup-repository rather than
+LVM capacity.
+
+### Run from the command line
+
+First expand the default matrix without contacting or modifying the cluster:
+
+```bash
+./scripts/harvester-vmbackup-benchmark \
+  --profile standard \
+  --dry-run \
+  --output-dir ./results
+```
+
+The command prints the complete matrix and creates a report directory under
+`./results/`. A dry run does not require an image URL or kubeconfig.
+
+Next run the smoke profile with environment-specific values:
+
+```bash
+export KUBECONFIG="/absolute/path/to/harvester-kubeconfig.yaml"
+IMAGE_URL="https://example.com/path/to/cloud-image.qcow2"
+IMAGE_STORAGE_CLASS="your-image-storage-class"
+DATA_STORAGE_CLASS="your-data-storage-class"
+SNAPSHOT_CLASS="your-volume-snapshot-class"
+NAMESPACE="vmbackup-benchmark"
+
+./scripts/harvester-vmbackup-benchmark \
+  --profile smoke \
+  --kubeconfig "$KUBECONFIG" \
+  --namespace "$NAMESPACE" \
+  --image-url "$IMAGE_URL" \
+  --image-storage-class "$IMAGE_STORAGE_CLASS" \
+  --data-storage-class "$DATA_STORAGE_CLASS" \
+  --snapshot-class "$SNAPSHOT_CLASS" \
+  --sizes-gib 10 \
+  --engines restic,kopia \
+  --network-name default/mgmt-vlan \
+  --guest-interface-name enp1s0 \
+  --node-selector network.harvesterhci.io/mgmt=true \
+  --output-dir ./results
+```
+
+When the smoke run succeeds and its restored hashes are correct, run the normal
+benchmark. The following uses every normal suite and five paired repetitions:
+
+```bash
+./scripts/harvester-vmbackup-benchmark \
+  --profile standard \
+  --kubeconfig "$KUBECONFIG" \
+  --namespace "$NAMESPACE" \
+  --image-url "$IMAGE_URL" \
+  --image-storage-class "$IMAGE_STORAGE_CLASS" \
+  --data-storage-class "$DATA_STORAGE_CLASS" \
+  --snapshot-class "$SNAPSHOT_CLASS" \
+  --sizes-gib 10,20,30 \
+  --engines restic,kopia \
+  --suites capacity,sensitivity,incremental,cache \
+  --paired-runs 5 \
+  --seed harvester-vmbackup-benchmark-v1 \
+  --network-name default/mgmt-vlan \
+  --guest-interface-name enp1s0 \
+  --node-selector network.harvesterhci.io/mgmt=true \
+  --cooldown 60 \
+  --output-dir ./results
+```
+
+Add the fault-recovery campaigns only when needed:
+
+```bash
+--include-fault-recovery \
+--fault-runs 3 \
+--fault-progress-percent 30 \
+--s3-pause-seconds 60
+```
+
+Run `./scripts/harvester-vmbackup-benchmark --help` for all VM sizing, SSH,
+timeout, collection, retention, and suite-selection options.
+
+### Results and benchmark cleanup
+
+At startup the benchmark prints its run ID and artifact directory. Each run is
+stored below `--output-dir` as `vmbr-<timestamp>-<token>/` and includes:
+
+- `report.md`, `summary.json`, and `charts/duration.svg`
+- `config.json`, `matrix.json`, `environment.json`, and `events.ndjson`
+- `results/operations.csv` with per-operation timings, throughput, repository
+  deltas, resource usage, failures, and correctness results
+- `metrics/pod-samples.csv` with raw pod CPU, memory, and network samples
+- Supporting Kubernetes and repository captures when collected
+
+Source VMs, restored VMs, temporary PVCs, policies, and the imported image are
+cleaned at the end. Benchmark `VirtualMachineBackup` objects are retained by
+default so results can be inspected without repository deletion changing later
+measurements. To delete them automatically after reporting, add
+`--delete-backups`.
+
+To explicitly clean Kubernetes resources retained by one benchmark run:
+
+```bash
+./scripts/harvester-vmbackup-benchmark \
+  --kubeconfig "$KUBECONFIG" \
+  --namespace "$NAMESPACE" \
+  --cleanup-run vmbr-YYYYMMDDHHMMSS-TOKEN
+```
+
+Cleanup deletes resources carrying that exact benchmark run label. Deleting
+retained `VirtualMachineBackup` objects may also remove their remote repository
+data through the Harvester backup controller, so review the run ID first.
+
 ## Command-line usage
 
 Copy this example, update the environment-specific values, and run it from the
@@ -332,6 +532,7 @@ NAMESPACE="default"
   --node-selector network.harvesterhci.io/mgmt=true \
   --iterations 3 \
   --parallel 2 \
+  --vm-backup-types restic,kopia \
   --root-data-size-gib 1 \
   --data-size-gib 10 \
   --poll-interval 5 \
@@ -348,10 +549,12 @@ NAMESPACE="default"
 ```
 
 This example runs two workers concurrently, with three iterations per worker,
-for six snapshot/restore and integrity-check cycles in total. Iterations within
-one worker are sequential. If source or restored VM/PVC provisioning exceeds
-the cluster-operation timeout, or guest readiness exceeds 15 minutes, that
-logical iteration is retried once with newly created VMs. Set
+for six backup/restore and integrity-check cycles in total. Each worker alternates
+between `restic` and `kopia`; workers are offset so concurrent iterations exercise
+both types. Iterations within one worker are sequential. If source or restored
+VM/PVC provisioning exceeds the cluster-operation timeout, or guest readiness
+exceeds 15 minutes, that logical iteration is retried once with newly created VMs
+and the same backup type. Set
 `--ssh-vm-retries 0` to disable retries. A boot clone attempt also fails early
 after three related CDI pod restarts instead of waiting for the full operation
 timeout.
@@ -381,7 +584,7 @@ appear in its CA bundle, and recreates the full iteration. The default is one
 such recovery attempt; use `--cdi-clone-retries 0` to disable it. Other CDI or
 storage failures do not consume this retry budget.
 
-By default, a VM snapshot error may recover for up to 60 seconds before the
+By default, a VM backup error may recover for up to 60 seconds before the
 iteration fails. The first error and any recovery are logged. Set
 `--snapshot-error-grace 0` to restore strict fail-fast behavior.
 
@@ -462,8 +665,8 @@ when possible.
   smaller than the PVC, and the root disk must also have room for the guest OS,
   packages, logs, and filesystem metadata.
 - Capacity usage scales with both `--parallel` and `--data-volume-count` because
-  every worker can have a source VM, snapshots, and restored storage at the same
-  time.
+  every worker can have a source VM, backup artifacts, and restored storage at the
+  same time. Remote backups also consume capacity on the configured backup target.
 - Every data disk is formatted as ext4 inside the guest when it has no existing
   filesystem signature. The script refuses to format the root device or a disk
   with an unexpected signature.
@@ -486,7 +689,7 @@ when possible.
   `--keep-failed-resources` for long parallel runs. It preserves the failed
   iteration without retaining every successful iteration.
 - Use a dedicated namespace and non-production storage classes when possible;
-  the test creates, snapshots, restores, formats, and deletes storage resources.
+  the test creates, backs up, restores, formats, and deletes storage resources.
 
 ## Troubleshooting
 

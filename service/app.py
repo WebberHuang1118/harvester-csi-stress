@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT_DIR / "scripts" / "harvester-csi-stress-test"
+BENCHMARK_SCRIPT_PATH = ROOT_DIR / "scripts" / "harvester-vmbackup-benchmark"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_LOG_ENTRIES = 20_000
@@ -32,7 +33,12 @@ MODES = [
     {
         "value": "stress",
         "label": "Stress test",
-        "description": "Create VMs, snapshot and restore them, then verify disk data.",
+        "description": "Create VMs, back up and restore them, then verify disk data.",
+    },
+    {
+        "value": "benchmark",
+        "label": "Restic/Kopia benchmark",
+        "description": "Run reproducible paired VMBackup/VMRestore measurements with durable reports.",
     },
     {
         "value": "cleanup_run",
@@ -53,7 +59,7 @@ PARAMETERS = [
         "type": "text",
         "default": os.environ.get("KUBECONFIG", ""),
         "group": "Cluster connection",
-        "modes": ["stress", "cleanup_run", "cleanup_all"],
+        "modes": ["stress", "benchmark", "cleanup_run", "cleanup_all"],
         "placeholder": "/absolute/path/to/kubeconfig.yaml",
         "help": "Defaults to the KUBECONFIG inherited by this service. Leave empty for Kubernetes' standard lookup.",
     },
@@ -64,7 +70,7 @@ PARAMETERS = [
         "default": "default",
         "required": True,
         "group": "Cluster connection",
-        "modes": ["stress", "cleanup_run", "cleanup_all"],
+        "modes": ["stress", "benchmark", "cleanup_run", "cleanup_all"],
         "help": "Namespace in which resources are created or cleaned.",
     },
     {
@@ -76,7 +82,7 @@ PARAMETERS = [
         "suffix": "seconds",
         "required": True,
         "group": "Cluster connection",
-        "modes": ["stress", "cleanup_run", "cleanup_all"],
+        "modes": ["stress", "benchmark", "cleanup_run", "cleanup_all"],
         "help": (
             "Maximum wait for each asynchronous cluster operation and cleanup action; "
             "guest SSH uses its own timeout."
@@ -89,7 +95,7 @@ PARAMETERS = [
         "default": "",
         "required": True,
         "group": "VM and storage",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "placeholder": "https://example.com/cloud-image.qcow2",
         "help": "Source URL for the Harvester VirtualMachineImage.",
     },
@@ -97,10 +103,10 @@ PARAMETERS = [
         "key": "image_storage_class",
         "label": "Image storage class",
         "type": "text",
-        "default": "",
+        "default": "lvm-95-thin",
         "required": True,
         "group": "VM and storage",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "placeholder": "image-storage-class",
         "help": "StorageClass used for the Harvester VM image and generated boot PVCs.",
     },
@@ -108,10 +114,10 @@ PARAMETERS = [
         "key": "data_storage_class",
         "label": "Data storage class",
         "type": "text",
-        "default": "",
+        "default": "lvm-95-thin",
         "required": True,
         "group": "VM and storage",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "placeholder": "data-storage-class",
         "help": "StorageClass for generated data PVCs.",
     },
@@ -123,7 +129,7 @@ PARAMETERS = [
         "min": 1,
         "required": True,
         "group": "VM and storage",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
     },
     {
         "key": "memory",
@@ -132,7 +138,7 @@ PARAMETERS = [
         "default": "4Gi",
         "required": True,
         "group": "VM and storage",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "placeholder": "4Gi",
         "help": "Kubernetes memory quantity assigned to each VM.",
     },
@@ -145,7 +151,7 @@ PARAMETERS = [
         "suffix": "GiB",
         "required": True,
         "group": "VM and storage",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
     },
     {
         "key": "data_volume_count",
@@ -216,7 +222,7 @@ PARAMETERS = [
         "default": "default/mgmt-vlan",
         "required": True,
         "group": "VM network",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "placeholder": "namespace/network-name",
         "help": "NetworkAttachmentDefinition used by each VM.",
     },
@@ -227,7 +233,7 @@ PARAMETERS = [
         "default": "enp1s0",
         "required": True,
         "group": "VM network",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "help": "Linux network interface configured for DHCP by cloud-init.",
     },
     {
@@ -236,9 +242,171 @@ PARAMETERS = [
         "type": "text",
         "default": "network.harvesterhci.io/mgmt=true",
         "group": "VM network",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "placeholder": "KEY=VALUE (empty disables affinity)",
         "help": "Restricts VM scheduling to matching nodes. Clear this field to disable the selector.",
+    },
+    {
+        "key": "benchmark_profile",
+        "label": "Benchmark profile",
+        "type": "select",
+        "options": ["smoke", "standard", "custom"],
+        "default": "standard",
+        "required": True,
+        "group": "Benchmark matrix",
+        "modes": ["benchmark"],
+        "help": "Smoke runs one 10 GiB pair; standard runs the selected normal suites; custom uses the same explicit fields without changing safety checks.",
+    },
+    {
+        "key": "benchmark_engines",
+        "label": "Engines",
+        "type": "select",
+        "options": ["restic,kopia", "restic", "kopia"],
+        "default": "restic,kopia",
+        "required": True,
+        "group": "Benchmark matrix",
+        "modes": ["benchmark"],
+    },
+    {
+        "key": "benchmark_sizes_gib",
+        "label": "Data-device sizes",
+        "type": "text",
+        "default": "10,20,30",
+        "required": True,
+        "group": "Benchmark matrix",
+        "modes": ["benchmark"],
+        "suffix": "GiB",
+        "help": "Comma-separated positive integer capacities.",
+    },
+    {
+        "key": "benchmark_paired_runs",
+        "label": "Paired runs",
+        "type": "number",
+        "default": 5,
+        "min": 1,
+        "required": True,
+        "group": "Benchmark matrix",
+        "modes": ["benchmark"],
+        "help": "Matched Restic/Kopia repetitions for every enabled normal-case cell.",
+    },
+    {
+        "key": "benchmark_suites",
+        "label": "Normal suites",
+        "type": "text",
+        "default": "capacity,sensitivity,incremental,cache",
+        "required": True,
+        "group": "Benchmark matrix",
+        "modes": ["benchmark"],
+        "help": "Comma-separated subset of capacity, sensitivity, incremental, and cache.",
+    },
+    {
+        "key": "benchmark_seed",
+        "label": "Dataset seed",
+        "type": "text",
+        "default": "harvester-vmbackup-benchmark-v1",
+        "required": True,
+        "group": "Benchmark matrix",
+        "modes": ["benchmark"],
+    },
+    {
+        "key": "benchmark_snapshot_class",
+        "label": "VolumeSnapshotClass",
+        "type": "text",
+        "default": "lvm-snapshot",
+        "required": True,
+        "group": "Benchmark storage",
+        "modes": ["benchmark"],
+    },
+    {
+        "key": "benchmark_include_fault_recovery",
+        "label": "Include fault-recovery suite",
+        "type": "checkbox",
+        "default": False,
+        "group": "Optional fault recovery",
+        "modes": ["benchmark"],
+        "help": "Disabled by default. Adds pod-kill and S3-pause cases for backup and restore.",
+    },
+    {
+        "key": "benchmark_fault_runs",
+        "label": "Fault runs",
+        "type": "number",
+        "default": 3,
+        "min": 1,
+        "required": True,
+        "group": "Optional fault recovery",
+        "modes": ["benchmark"],
+    },
+    {
+        "key": "benchmark_fault_progress_percent",
+        "label": "Fault trigger progress",
+        "type": "number",
+        "default": 30,
+        "min": 1,
+        "max": 99,
+        "suffix": "%",
+        "required": True,
+        "group": "Optional fault recovery",
+        "modes": ["benchmark"],
+    },
+    {
+        "key": "benchmark_s3_pause_seconds",
+        "label": "S3 pause",
+        "type": "number",
+        "default": 60,
+        "min": 1,
+        "suffix": "seconds",
+        "required": True,
+        "group": "Optional fault recovery",
+        "modes": ["benchmark"],
+    },
+    {
+        "key": "benchmark_cooldown",
+        "label": "Campaign cooldown",
+        "type": "number",
+        "default": 60,
+        "min": 0,
+        "suffix": "seconds",
+        "required": True,
+        "group": "Collection and output",
+        "modes": ["benchmark"],
+    },
+    {
+        "key": "benchmark_poll_interval",
+        "label": "Metrics interval",
+        "type": "number",
+        "default": 1,
+        "min": 1,
+        "suffix": "seconds",
+        "required": True,
+        "group": "Collection and output",
+        "modes": ["benchmark"],
+    },
+    {
+        "key": "benchmark_output_dir",
+        "label": "Results directory",
+        "type": "text",
+        "default": str(ROOT_DIR / "results"),
+        "required": True,
+        "group": "Collection and output",
+        "modes": ["benchmark"],
+        "help": "Each run creates a durable run-ID subdirectory here.",
+    },
+    {
+        "key": "benchmark_keep_backups",
+        "label": "Retain benchmark backups",
+        "type": "checkbox",
+        "default": True,
+        "group": "Collection and output",
+        "modes": ["benchmark"],
+        "help": "Recommended for a shared repository; cleanup remains an explicit action.",
+    },
+    {
+        "key": "benchmark_dry_run",
+        "label": "Dry run (do not touch cluster)",
+        "type": "checkbox",
+        "default": False,
+        "group": "Collection and output",
+        "modes": ["benchmark"],
     },
     {
         "key": "iterations",
@@ -260,6 +428,31 @@ PARAMETERS = [
         "group": "Workload",
         "modes": ["stress"],
         "help": "Workers run concurrently; iterations within one worker run sequentially.",
+    },
+    {
+        "key": "vm_backup_types",
+        "label": "VM backup type(s)",
+        "type": "select",
+        "options": [
+            "snapshot",
+            "backup",
+            "restic",
+            "kopia",
+            "snapshot,backup",
+            "snapshot,restic",
+            "snapshot,kopia",
+            "backup,restic",
+            "backup,kopia",
+            "restic,kopia",
+        ],
+        "default": "snapshot",
+        "required": True,
+        "group": "Workload",
+        "modes": ["stress"],
+        "help": (
+            "Use one type for every iteration, or a comma-separated pair to alternate "
+            "between them. Remote types require a working Harvester backup target."
+        ),
     },
     {
         "key": "data_size_gib",
@@ -297,7 +490,7 @@ PARAMETERS = [
     },
     {
         "key": "snapshot_error_grace",
-        "label": "Snapshot error grace",
+        "label": "VM backup error grace",
         "type": "number",
         "default": 60,
         "min": 0,
@@ -306,7 +499,7 @@ PARAMETERS = [
         "group": "Workload",
         "modes": ["stress"],
         "help": (
-            "Continue waiting after a VM snapshot reports an error so controller "
+            "Continue waiting after a VM backup reports an error so controller "
             "retries can recover. Set to 0 for fail-fast behavior."
         ),
     },
@@ -331,7 +524,7 @@ PARAMETERS = [
         "default": "ubuntu",
         "required": True,
         "group": "Guest access",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
     },
     {
         "key": "ssh_timeout",
@@ -342,7 +535,7 @@ PARAMETERS = [
         "suffix": "seconds",
         "required": True,
         "group": "Guest access",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "help": (
             "Total time allowed for guest SSH readiness and for retrying transient "
             "SSH or virtctl failures during guest payload writes and restored checksums."
@@ -380,7 +573,7 @@ PARAMETERS = [
         "type": "text",
         "default": "",
         "group": "Guest access",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "placeholder": "Generated automatically when empty",
         "help": "Optional local path to an existing unencrypted private key.",
     },
@@ -391,10 +584,11 @@ PARAMETERS = [
         "default": "/dev/vdb",
         "required": True,
         "group": "Guest access",
-        "modes": ["stress"],
+        "modes": ["stress", "benchmark"],
         "help": (
-            "Device used when the data PVC count is 1. Multi-disk runs resolve "
-            "each disk by its generated virtio serial."
+            "Device used by benchmarks and when the stress-test data PVC count "
+            "is 1. Multi-disk stress runs resolve each disk by its generated "
+            "virtio serial."
         ),
     },
     {
@@ -449,6 +643,8 @@ SCRIPT_LOG = re.compile(
     r"(?:\[(?P<context>[^]]+)\] )?(?P<message>.*)$"
 )
 RUN_ID_LOG = re.compile(r"^Run ID: (?P<run_id>[a-z0-9.-]+)$")
+ARTIFACT_DIR_LOG = re.compile(r"^Artifact directory: (?P<artifact_dir>/.*)$")
+BENCHMARK_PROGRESS_LOG = re.compile(r"^Campaign (?P<current>[0-9]+)/(?P<total>[0-9]+):")
 TOTAL_LOG = re.compile(r"\((?P<total>\d+) total\)")
 RUN_ID_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$")
 
@@ -562,7 +758,13 @@ def normalize_config(payload: Any) -> dict[str, Any]:
     if mode == "stress":
         if config["keep_resources"] and config["keep_failed_resources"]:
             raise ConfigError("Keep resources and keep only failed iteration resources cannot both be enabled")
-        for key in ("boot_volume_mode", "data_volume_mode", "boot_access_mode", "data_access_mode"):
+        for key in (
+            "boot_volume_mode",
+            "data_volume_mode",
+            "boot_access_mode",
+            "data_access_mode",
+            "vm_backup_types",
+        ):
             options = PARAMETER_BY_KEY[key]["options"]
             if config[key] not in options:
                 raise ConfigError(f"{PARAMETER_BY_KEY[key]['label']} must be one of: {', '.join(options)}")
@@ -579,6 +781,28 @@ def normalize_config(payload: Any) -> dict[str, Any]:
             if not identity.is_file():
                 raise ConfigError(f"SSH identity file not found: {identity}")
             config["ssh_identity_file"] = str(identity.resolve())
+    elif mode == "benchmark":
+        if config["benchmark_profile"] not in PARAMETER_BY_KEY["benchmark_profile"]["options"]:
+            raise ConfigError("Benchmark profile is invalid")
+        if config["benchmark_engines"] not in PARAMETER_BY_KEY["benchmark_engines"]["options"]:
+            raise ConfigError("Benchmark engines are invalid")
+        if not re.fullmatch(r"[1-9][0-9]*(?:,[1-9][0-9]*)*", config["benchmark_sizes_gib"]):
+            raise ConfigError("Data-device sizes must be comma-separated positive integers")
+        suites = config["benchmark_suites"].split(",")
+        allowed_suites = {"capacity", "sensitivity", "incremental", "cache"}
+        if not suites or any(suite not in allowed_suites for suite in suites) or len(suites) != len(set(suites)):
+            raise ConfigError("Normal suites must be a unique comma-separated subset of capacity, sensitivity, incremental, cache")
+        if config["benchmark_fault_progress_percent"] > 99:
+            raise ConfigError("Fault trigger progress must be at most 99")
+        if config["node_selector"]:
+            selector_key, separator, selector_value = config["node_selector"].partition("=")
+            if not separator or not selector_key or not selector_value:
+                raise ConfigError("Required node selector must use KEY=VALUE syntax")
+        if config["ssh_identity_file"]:
+            identity = Path(config["ssh_identity_file"]).expanduser()
+            if not identity.is_file():
+                raise ConfigError(f"SSH identity file not found: {identity}")
+            config["ssh_identity_file"] = str(identity.resolve())
     elif mode == "cleanup_run":
         run_id = config["cleanup_run_id"]
         if not RUN_ID_PATTERN.fullmatch(run_id):
@@ -590,8 +814,54 @@ def normalize_config(payload: Any) -> dict[str, Any]:
 
 
 def build_command(config: dict[str, Any]) -> list[str]:
-    command = [str(SCRIPT_PATH)]
     mode = config["mode"]
+
+    if mode == "benchmark":
+        command = [str(BENCHMARK_SCRIPT_PATH)]
+        argument_map = [
+            ("--profile", "benchmark_profile"),
+            ("--image-url", "image_url"),
+            ("--image-storage-class", "image_storage_class"),
+            ("--data-storage-class", "data_storage_class"),
+            ("--snapshot-class", "benchmark_snapshot_class"),
+            ("--sizes-gib", "benchmark_sizes_gib"),
+            ("--paired-runs", "benchmark_paired_runs"),
+            ("--fault-runs", "benchmark_fault_runs"),
+            ("--suites", "benchmark_suites"),
+            ("--engines", "benchmark_engines"),
+            ("--seed", "benchmark_seed"),
+            ("--output-dir", "benchmark_output_dir"),
+            ("--cpu", "cpu"),
+            ("--memory", "memory"),
+            ("--boot-size-gib", "boot_size_gib"),
+            ("--network-name", "network_name"),
+            ("--guest-interface-name", "guest_interface_name"),
+            ("--node-selector", "node_selector"),
+            ("--ssh-user", "ssh_user"),
+            ("--guest-device", "guest_device"),
+            ("--operation-timeout", "timeout"),
+            ("--ssh-timeout", "ssh_timeout"),
+            ("--poll-interval", "benchmark_poll_interval"),
+            ("--cooldown", "benchmark_cooldown"),
+            ("--s3-pause-seconds", "benchmark_s3_pause_seconds"),
+            ("--fault-progress-percent", "benchmark_fault_progress_percent"),
+        ]
+        for flag, key in argument_map:
+            command.extend([flag, str(config[key])])
+        if config["kubeconfig"]:
+            command.extend(["--kubeconfig", config["kubeconfig"]])
+        command.extend(["--namespace", config["namespace"]])
+        if config["ssh_identity_file"]:
+            command.extend(["--ssh-identity-file", config["ssh_identity_file"]])
+        if config["benchmark_include_fault_recovery"]:
+            command.append("--include-fault-recovery")
+        if not config["benchmark_keep_backups"]:
+            command.append("--delete-backups")
+        if config["benchmark_dry_run"]:
+            command.append("--dry-run")
+        return command
+
+    command = [str(SCRIPT_PATH)]
 
     if mode == "cleanup_all":
         command.append("--cleanup")
@@ -616,6 +886,7 @@ def build_command(config: dict[str, Any]) -> list[str]:
             ("--node-selector", "node_selector"),
             ("--iterations", "iterations"),
             ("--parallel", "parallel"),
+            ("--vm-backup-types", "vm_backup_types"),
             ("--data-size-gib", "data_size_gib"),
             ("--root-data-size-gib", "root_data_size_gib"),
             ("--poll-interval", "poll_interval"),
@@ -658,6 +929,7 @@ class Job:
         self.logs: deque[dict[str, Any]] = deque(maxlen=MAX_LOG_ENTRIES)
         self.next_sequence = 1
         self.run_id = ""
+        self.artifact_dir = ""
         self.total_iterations = 0
         self.completed_iterations = 0
         self.last_message = "Preparing process"
@@ -693,6 +965,20 @@ class Job:
             run_match = RUN_ID_LOG.match(message)
             if run_match:
                 self.run_id = run_match.group("run_id")
+            artifact_match = ARTIFACT_DIR_LOG.match(message)
+            if artifact_match:
+                candidate = Path(artifact_match.group("artifact_dir")).resolve()
+                results_root = (ROOT_DIR / "results").resolve()
+                try:
+                    candidate.relative_to(results_root)
+                except ValueError:
+                    pass
+                else:
+                    self.artifact_dir = str(candidate)
+            benchmark_match = BENCHMARK_PROGRESS_LOG.match(message)
+            if benchmark_match:
+                self.total_iterations = int(benchmark_match.group("total"))
+                self.completed_iterations = max(0, int(benchmark_match.group("current")) - 1)
             if message.startswith("Starting "):
                 total_match = TOTAL_LOG.search(message)
                 if total_match:
@@ -711,6 +997,7 @@ class Job:
                 "ended_at": self.ended_at,
                 "exit_code": self.exit_code,
                 "run_id": self.run_id,
+                "artifact_dir": self.artifact_dir,
                 "total_iterations": self.total_iterations,
                 "completed_iterations": self.completed_iterations,
                 "last_message": self.last_message,
@@ -916,6 +1203,42 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"job": job.snapshot()})
             return
 
+        artifact_match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})/artifacts(?:/(.*))?", parsed.path)
+        if artifact_match:
+            job = self.server.manager.get(artifact_match.group(1))
+            if job is None or not job.artifact_dir:
+                self._send_error_json("Artifacts are not available", HTTPStatus.NOT_FOUND)
+                return
+            root = Path(job.artifact_dir).resolve()
+            relative = artifact_match.group(2)
+            if not relative:
+                files = [
+                    {"path": str(path.relative_to(root)), "size": path.stat().st_size}
+                    for path in sorted(root.rglob("*"))
+                    if path.is_file()
+                ]
+                self._send_json({"files": files})
+                return
+            target = (root / relative).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                self._send_error_json("Invalid artifact path", HTTPStatus.BAD_REQUEST)
+                return
+            if not target.is_file():
+                self._send_error_json("Artifact not found", HTTPStatus.NOT_FOUND)
+                return
+            data = target.read_bytes()
+            content_type = "text/markdown; charset=utf-8" if target.suffix == ".md" else "application/octet-stream"
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         static_files = {
             "/": ("index.html", "text/html; charset=utf-8"),
             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -991,6 +1314,8 @@ def main() -> int:
     arguments = parse_arguments()
     if not SCRIPT_PATH.is_file():
         raise SystemExit(f"Stress-test script not found: {SCRIPT_PATH}")
+    if not BENCHMARK_SCRIPT_PATH.is_file():
+        raise SystemExit(f"Benchmark script not found: {BENCHMARK_SCRIPT_PATH}")
 
     manager = JobManager()
     server = StressHTTPServer(("127.0.0.1", arguments.port), RequestHandler)

@@ -266,6 +266,30 @@ legend, .group-title {
   line-height: 1.4;
 }
 
+.matrix-preview,
+.artifact-panel {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid #b8d8cf;
+  border-radius: 8px;
+  background: #f1faf7;
+  color: #23443d;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.artifact-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.artifact-panel a {
+  color: #176b5b;
+  font-weight: 700;
+}
+
 .action-row { margin-top: 20px; display: grid; grid-template-columns: 1fr auto; gap: 9px; }
 .primary-button, .danger-button {
   height: 42px;
