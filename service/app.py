@@ -43,12 +43,12 @@ MODES = [
     {
         "value": "cleanup_run",
         "label": "Clean one run",
-        "description": "Delete resources associated with one stress-test run ID.",
+        "description": "Delete resources associated with one stress or benchmark run ID.",
     },
     {
         "value": "cleanup_all",
         "label": "Clean all runs",
-        "description": "Delete all detected stress-test resources in the namespace.",
+        "description": "Delete all detected stress and benchmark resources in the namespace.",
     },
 ]
 
@@ -859,6 +859,12 @@ def build_command(config: dict[str, Any]) -> list[str]:
             command.append("--delete-backups")
         if config["benchmark_dry_run"]:
             command.append("--dry-run")
+        return command
+
+    if mode == "cleanup_run" and config["cleanup_run_id"].startswith("vmbr-"):
+        command = [str(BENCHMARK_SCRIPT_PATH), "--cleanup-run", config["cleanup_run_id"]]
+        command.extend(["--kubeconfig", config["kubeconfig"]])
+        command.extend(["--namespace", config["namespace"]])
         return command
 
     command = [str(SCRIPT_PATH)]

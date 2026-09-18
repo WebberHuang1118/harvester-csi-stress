@@ -301,10 +301,11 @@ and cleaned before retrying; only the final failed attempt is retained.
 
 The GUI also provides two cleanup modes:
 
-- **Clean one run:** enter the run ID shown in the output to remove resources
+- **Clean one run:** enter a stress or benchmark run ID to remove resources
   from that run.
-- **Clean all runs:** list and remove detected stress-test resources in the
-  selected namespace. This mode requires an additional confirmation.
+- **Clean all runs:** list and remove detected stress and benchmark resources
+  in the selected namespace. This includes retained benchmark backups and may
+  delete their remote repository data. This mode requires confirmation.
 
 Prefer single-run cleanup when the run ID is known.
 
@@ -501,6 +502,8 @@ To explicitly clean Kubernetes resources retained by one benchmark run:
 Cleanup deletes resources carrying that exact benchmark run label. Deleting
 retained `VirtualMachineBackup` objects may also remove their remote repository
 data through the Harvester backup controller, so review the run ID first.
+The GUI's **Clean all runs** action also selects benchmark resources, and
+**Clean one run** accepts a `vmbr-` run ID.
 
 ## Command-line usage
 
@@ -643,7 +646,7 @@ RUN_ID="csi-stress-YYYYMMDDHHMMSS-NNNNN"
   --namespace default
 ```
 
-To list and remove resources from every detected stress-test run in a namespace:
+To list and remove resources from every detected stress and benchmark run in a namespace:
 
 ```bash
 ./scripts/harvester-csi-stress-test \
@@ -651,9 +654,11 @@ To list and remove resources from every detected stress-test run in a namespace:
   --namespace default
 ```
 
-Global cleanup selects resources using the stress-run label and generated name
-prefixes. Review the printed resource list carefully and prefer `--cleanup-run`
-when possible.
+Global cleanup selects stress resources using the stress-run label and generated
+name prefixes, then benchmark resources using the benchmark-run label. It also
+deletes retained benchmark backups, which may remove remote repository data.
+Review the printed resource list carefully and prefer `--cleanup-run` when
+possible.
 
 ## Operational considerations
 

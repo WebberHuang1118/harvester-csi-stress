@@ -81,6 +81,27 @@ def benchmark_payload() -> dict[str, object]:
 
 
 class BenchmarkServiceTests(unittest.TestCase):
+    def test_cleanup_all_includes_both_run_types(self) -> None:
+        config = normalize_config({
+            "mode": "cleanup_all",
+            "confirm_cleanup": True,
+            "namespace": "default",
+        })
+        self.assertIn("harvester-csi-stress-test", build_command(config)[0])
+        self.assertIn("--cleanup", build_command(config))
+
+    def test_cleanup_run_uses_benchmark_command(self) -> None:
+        config = normalize_config({
+            "mode": "cleanup_run",
+            "cleanup_run_id": "vmbr-20260917104123-924d0ccc",
+            "kubeconfig": "",
+            "namespace": "default",
+        })
+        command = build_command(config)
+        self.assertIn("harvester-vmbackup-benchmark", command[0])
+        self.assertIn("--cleanup-run", command)
+        self.assertEqual(command[command.index("--kubeconfig") + 1], "")
+
     def test_benchmark_command_defaults_to_no_faults_and_retains_backups(self) -> None:
         config = normalize_config(benchmark_payload())
         command = build_command(config)
