@@ -124,13 +124,30 @@ class Cluster:
         return self.run(["kubectl", *arguments], **kwargs)
 
     def json(self, arguments: list[str], *, check: bool = True) -> dict[str, Any]:
-        output = self.kubectl([*arguments, "-o", "json"], check=check)
+        command = ["kubectl", *arguments, "-o", "json"]
+        process = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self.environment,
+            check=False,
+        )
+        if process.returncode != 0:
+            if not check and "(NotFound)" in process.stderr:
+                return {}
+            raise CommandError(command, process.returncode, process.stderr or process.stdout)
+        output = process.stdout
         if not output and not check:
             return {}
         try:
             value = json.loads(output)
         except json.JSONDecodeError as error:
-            raise RuntimeError(f"kubectl returned invalid JSON for {arguments!r}") from error
+            raise RuntimeError(
+                f"kubectl returned invalid JSON for {arguments!r}: {output[:500]!r}"
+            ) from error
         if not isinstance(value, dict):
             raise RuntimeError(f"kubectl returned non-object JSON for {arguments!r}")
         return value
