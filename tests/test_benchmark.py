@@ -4,10 +4,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from subprocess import CompletedProcess
+from unittest.mock import patch
 
 from benchmark.model import BenchmarkConfig, build_matrix, campaign_seed, matrix_summary, parse_sizes
 from benchmark.report import describe, generate_report
-from benchmark.runner import parse_prometheus
+from benchmark.runner import Cluster, CommandError, parse_prometheus
 
 
 class MatrixTests(unittest.TestCase):
@@ -64,6 +66,40 @@ class MatrixTests(unittest.TestCase):
             parse_sizes("10,nope")
 
 
+class ClusterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cluster = Cluster(BenchmarkConfig(dry_run=True), Path("."), lambda _: None)
+
+    @patch("benchmark.runner.time.sleep")
+    @patch("benchmark.runner.subprocess.run")
+    def test_wait_for_pvc_retries_not_found(self, run, sleep) -> None:
+        run.side_effect = [
+            CompletedProcess([], 1, "", 'Error from server (NotFound): PVC "p0" not found'),
+            CompletedProcess([], 0, '{"status":{"phase":"Bound"}}', ""),
+        ]
+        pvc = self.cluster.wait_for(
+            "persistentvolumeclaim", "p0",
+            lambda value: value.get("status", {}).get("phase") == "Bound",
+        )
+        self.assertEqual(pvc["status"]["phase"], "Bound")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once()
+
+    @patch("benchmark.runner.subprocess.run")
+    def test_get_keeps_other_kubectl_errors(self, run) -> None:
+        run.return_value = CompletedProcess([], 1, "", "Error from server (Forbidden): denied")
+        with self.assertRaisesRegex(CommandError, "Forbidden"):
+            self.cluster.get("persistentvolumeclaim", "p0", check=False)
+
+    @patch("benchmark.runner.subprocess.run")
+    def test_json_ignores_stderr_warning(self, run) -> None:
+        run.return_value = CompletedProcess([], 0, '{"kind":"PersistentVolumeClaim"}', "warning")
+        self.assertEqual(
+            self.cluster.get("persistentvolumeclaim", "p0")["kind"],
+            "PersistentVolumeClaim",
+        )
+
+
 class MetricTests(unittest.TestCase):
     def test_prometheus_parser(self) -> None:
         values = parse_prometheus(
@@ -98,4 +134,3 @@ class MetricTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
