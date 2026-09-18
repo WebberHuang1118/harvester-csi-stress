@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import runpy
 import tempfile
 import unittest
 from pathlib import Path
@@ -98,6 +99,42 @@ class ClusterTests(unittest.TestCase):
             self.cluster.get("persistentvolumeclaim", "p0")["kind"],
             "PersistentVolumeClaim",
         )
+
+
+class CleanupTests(unittest.TestCase):
+    def test_cleanup_all_selects_and_verifies_benchmark_backups(self) -> None:
+        script = runpy.run_path(str(Path(__file__).parents[1] / "scripts/harvester-vmbackup-benchmark"))
+        arguments = script["parser"]().parse_args(["--cleanup-all", "--namespace", "default"])
+        calls = []
+        deleted = False
+
+        def kubectl(command, **kwargs):
+            nonlocal deleted
+            calls.append(command)
+            if command[1] == "delete":
+                deleted = True
+                return CompletedProcess(command, 0, "", "")
+            if command[2] == "virtualmachinebackups.harvesterhci.io" and not deleted:
+                return CompletedProcess(command, 0, "virtualmachinebackup.harvesterhci.io/b1\n", "")
+            return CompletedProcess(command, 0, "", "")
+
+        with patch("subprocess.run", side_effect=kubectl):
+            self.assertEqual(script["cleanup_resources"](arguments), 0)
+        deletes = [command for command in calls if command[1] == "delete"]
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(deletes[0][deletes[0].index("-l") + 1], "benchmark.harvesterhci.io/run")
+
+    def test_cleanup_reports_resources_that_remain(self) -> None:
+        script = runpy.run_path(str(Path(__file__).parents[1] / "scripts/harvester-vmbackup-benchmark"))
+        arguments = script["parser"]().parse_args(["--cleanup-all"])
+
+        def kubectl(command, **kwargs):
+            if command[2] == "virtualmachinebackups.harvesterhci.io":
+                return CompletedProcess(command, 0, "virtualmachinebackup.harvesterhci.io/b1\n", "")
+            return CompletedProcess(command, 0, "", "")
+
+        with patch("subprocess.run", side_effect=kubectl):
+            self.assertEqual(script["cleanup_resources"](arguments), 1)
 
 
 class MetricTests(unittest.TestCase):

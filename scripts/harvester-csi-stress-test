@@ -148,7 +148,7 @@ Options:
   --keep-resources         Do not remove resources created by the script.
   --keep-failed-resources  Retain only the failed iteration and shared image for
                            diagnostics; successful iterations are still removed.
-  --cleanup                List and delete resources from every old stress run.
+	--cleanup                List and delete resources from all stress and benchmark runs.
   --cleanup-run RUN_ID     List and delete resources from one stress run.
   -h, --help               Show this help.
 
@@ -1410,8 +1410,16 @@ on_exit() {
 }
 
 if [[ "$CLEANUP_MODE" == true ]]; then
-	cleanup_old_runs
-	exit 0
+	if [[ -n "$CLEANUP_RUN_ID" ]]; then
+		cleanup_old_runs
+		exit 0
+	fi
+	cleanup_status=0
+	cleanup_old_runs || cleanup_status=1
+	"$(dirname "$0")/harvester-vmbackup-benchmark" \
+		--cleanup-all --namespace "$NAMESPACE" \
+		--kubeconfig "$KUBECONFIG_PATH" || cleanup_status=1
+	exit "$cleanup_status"
 fi
 
 trap on_exit EXIT

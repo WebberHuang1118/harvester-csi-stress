@@ -66,37 +66,82 @@ def parser() -> argparse.ArgumentParser:
         help="Delete benchmark VMBackup CRs after reporting (retained by default).",
     )
     result.add_argument("--dry-run", action="store_true", help="Expand the matrix and write artifacts without changing the cluster")
-    result.add_argument(
+    cleanup = result.add_mutually_exclusive_group()
+    cleanup.add_argument(
         "--cleanup-run",
         metavar="RUN_ID",
         help="Explicitly delete Kubernetes objects labeled with this benchmark run ID, including retained backups",
     )
+    cleanup.add_argument(
+        "--cleanup-all",
+        action="store_true",
+        help="Delete all Kubernetes objects labeled as benchmark resources in the namespace",
+    )
     return result
 
 
-def cleanup_run(arguments: argparse.Namespace) -> int:
-    if not arguments.cleanup_run or not arguments.cleanup_run.startswith("vmbr-"):
+def cleanup_resources(arguments: argparse.Namespace) -> int:
+    if arguments.cleanup_run and not arguments.cleanup_run.startswith("vmbr-"):
         raise SystemExit("--cleanup-run requires a benchmark run ID beginning with vmbr-")
     environment = os.environ.copy()
     if arguments.kubeconfig:
         environment["KUBECONFIG"] = arguments.kubeconfig
-    selector = f"benchmark.harvesterhci.io/run={arguments.cleanup_run}"
+    selector = "benchmark.harvesterhci.io/run"
+    if arguments.cleanup_run:
+        selector += f"={arguments.cleanup_run}"
     resources = (
         "virtualmachinerestores.harvesterhci.io",
         "virtualmachinebackups.harvesterhci.io",
         "virtualmachines.kubevirt.io",
+        "virtualmachineinstances.kubevirt.io",
         "virtualmachineimages.harvesterhci.io",
+        "datavolumes.cdi.kubevirt.io",
         "persistentvolumeclaims",
+        "volumesnapshots.snapshot.storage.k8s.io",
         "networkpolicies.networking.k8s.io",
+        "pods",
     )
-    print(f"Deleting benchmark resources selected by {selector!r} in {arguments.namespace}")
+    print(f"Benchmark resources selected by {selector!r} in {arguments.namespace}:", flush=True)
+    failed = False
     for resource in resources:
-        subprocess.run(
-            ["kubectl", "delete", resource, "-n", arguments.namespace, "-l", selector, "--ignore-not-found"],
+        get_command = ["kubectl", "get", resource, "-n", arguments.namespace, "-l", selector, "-o", "name"]
+        selected = subprocess.run(
+            get_command,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if selected.returncode != 0:
+            print(selected.stderr, file=sys.stderr, end="")
+            failed = True
+            continue
+        if not selected.stdout:
+            continue
+        print(selected.stdout, end="", flush=True)
+        deleted = subprocess.run(
+            [
+                "kubectl", "delete", resource, "-n", arguments.namespace,
+                "-l", selector, "--ignore-not-found",
+                f"--timeout={arguments.operation_timeout}s",
+            ],
             env=environment,
             check=False,
         )
-    return 0
+        if deleted.returncode != 0:
+            failed = True
+            continue
+        remaining = subprocess.run(
+            get_command,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if remaining.returncode != 0 or remaining.stdout:
+            print(f"Benchmark resources remain for {resource}: {remaining.stdout or remaining.stderr}", file=sys.stderr)
+            failed = True
+    return 1 if failed else 0
 
 
 def config_from_arguments(arguments: argparse.Namespace) -> BenchmarkConfig:
@@ -144,8 +189,8 @@ def config_from_arguments(arguments: argparse.Namespace) -> BenchmarkConfig:
 
 def main() -> int:
     arguments = parser().parse_args()
-    if arguments.cleanup_run:
-        return cleanup_run(arguments)
+    if arguments.cleanup_run or arguments.cleanup_all:
+        return cleanup_resources(arguments)
     config = config_from_arguments(arguments)
     try:
         config.validate()

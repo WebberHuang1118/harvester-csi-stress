@@ -642,9 +642,18 @@ async function submitOperation(event) {
 
   const payload = currentPayload();
   if (state.mode === "cleanup_all") {
-    const confirmed = window.confirm(`Delete all detected stress-test resources in namespace "${payload.namespace}"?`);
+    const confirmed = window.confirm(
+      `Delete all detected stress and benchmark resources in namespace "${payload.namespace}"? ` +
+      "This includes retained VM backups and may delete their remote backup data."
+    );
     if (!confirmed) return;
     payload.confirm_cleanup = true;
+  } else if (state.mode === "cleanup_run" && payload.cleanup_run_id.startsWith("vmbr-")) {
+    const confirmed = window.confirm(
+      `Delete benchmark resources for "${payload.cleanup_run_id}"? ` +
+      "This may delete remote backup data."
+    );
+    if (!confirmed) return;
   }
 
   state.submitting = true;
