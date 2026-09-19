@@ -610,6 +610,7 @@ SCRIPT_LOG = re.compile(
 RUN_ID_LOG = re.compile(r"^Run ID: (?P<run_id>[a-z0-9.-]+)$")
 ARTIFACT_DIR_LOG = re.compile(r"^Artifact directory: (?P<artifact_dir>/.*)$")
 BENCHMARK_PROGRESS_LOG = re.compile(r"^Campaign (?P<current>[0-9]+)/(?P<total>[0-9]+):")
+BENCHMARK_COMPLETION_LOG = re.compile(r"^Campaign .+ completed$")
 TOTAL_LOG = re.compile(r"\((?P<total>\d+) total\)")
 RUN_ID_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$")
 
@@ -948,6 +949,11 @@ class Job:
             if benchmark_match:
                 self.total_iterations = int(benchmark_match.group("total"))
                 self.completed_iterations = max(0, int(benchmark_match.group("current")) - 1)
+            if BENCHMARK_COMPLETION_LOG.match(message) and self.total_iterations:
+                self.completed_iterations = min(
+                    self.completed_iterations + 1,
+                    self.total_iterations,
+                )
             if message.startswith("Starting "):
                 total_match = TOTAL_LOG.search(message)
                 if total_match:
