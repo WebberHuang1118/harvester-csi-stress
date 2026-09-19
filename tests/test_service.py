@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from service.app import PARAMETERS, ConfigError, build_command, normalize_config
+from service.app import PARAMETERS, ConfigError, Job, build_command, normalize_config
 
 
 def stress_payload() -> dict[str, object]:
@@ -81,6 +81,23 @@ def benchmark_payload() -> dict[str, object]:
 
 
 class BenchmarkServiceTests(unittest.TestCase):
+    def test_benchmark_progress_counts_final_completed_campaign(self) -> None:
+        job = Job({"mode": "benchmark", "kubeconfig": ""}, ["benchmark"])
+
+        job.append_log("Campaign 7/7: cache-s20-mixed-r1")
+        self.assertEqual(job.completed_iterations, 6)
+
+        job.append_log("Campaign cache-s20-mixed-r1 completed")
+        self.assertEqual(job.completed_iterations, 7)
+
+    def test_benchmark_progress_does_not_count_failed_campaign(self) -> None:
+        job = Job({"mode": "benchmark", "kubeconfig": ""}, ["benchmark"])
+
+        job.append_log("Campaign 7/7: cache-s20-mixed-r1")
+        job.append_log("Campaign cache-s20-mixed-r1 failed: backup failed")
+
+        self.assertEqual(job.completed_iterations, 6)
+
     def test_cleanup_all_includes_both_run_types(self) -> None:
         config = normalize_config({
             "mode": "cleanup_all",
