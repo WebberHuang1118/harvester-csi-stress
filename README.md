@@ -13,7 +13,7 @@ During each iteration, the test:
 1. Generates and creates a minimal KubeVirt VM with boot and data PVCs.
 2. Waits for the VM, both PVCs, and guest SSH access. Guest readiness uses a
    dedicated timeout and can optionally retry the entire iteration with fresh
-   VMs.
+   VMs. A CDI clone source HTTP 401 gets its own fresh-iteration retry budget.
 3. Writes random payloads to the root filesystem and data disk and records their
    SHA-256 checksums.
 4. Creates a Harvester `VirtualMachineBackup` with filesystem freeze enabled.
@@ -197,7 +197,7 @@ GUI exposes every supported stress-test parameter in these groups:
   capacities, volume modes, and access modes
 - **VM network:** Multus network, guest interface name, and required node selector
 - **Workload:** iterations per worker, parallel workers, root/data payload sizes,
-  polling interval, and snapshot error grace
+  polling interval, snapshot error grace, and CDI clone authentication retries
 - **Guest access:** SSH user/key, SSH retry/connect timeouts, fresh-VM retries, guest
   data device, mount path, and resource retention
 
@@ -225,14 +225,15 @@ Important GUI and CLI defaults are:
 | Root / data payload | `1Gi` / `10Gi` |
 | Polling interval | `5` seconds |
 | Snapshot error grace | `60` seconds |
+| CDI clone authentication retries | `1` |
 | SSH user | `ubuntu` |
 | Guest data device / mount | `/dev/vdb` / `/mnt/csi-stress` |
 | Keep all resources / keep failed resources | Disabled / disabled |
 
 The GUI validates values before launching the process. In particular:
 
-- Numeric settings must be positive integers, except fresh VM retries, which may
-  be zero.
+- Numeric settings must be positive integers, except retry counts and snapshot
+  error grace, which may be zero.
 - The root payload must be smaller than the boot PVC capacity.
 - The data payload must be smaller than the data PVC capacity.
 - Kubeconfig and optional SSH identity files must exist on the service host.
@@ -337,6 +338,7 @@ NAMESPACE="default"
   --ssh-timeout 900 \
   --ssh-connect-timeout 30 \
   --ssh-vm-retries 1 \
+  --cdi-clone-retries 1 \
   --guest-device /dev/vdb \
   --guest-mount-path /mnt/csi-stress \
   --namespace "$NAMESPACE" \
@@ -345,9 +347,19 @@ NAMESPACE="default"
 
 This example runs two workers concurrently, with three iterations per worker,
 for six snapshot/restore and integrity-check cycles in total. Iterations within
-one worker are sequential. If source or restored VM guest readiness exceeds 15
-minutes, that logical iteration is retried once with newly created VMs. Set
-`--ssh-vm-retries 0` to disable retries.
+one worker are sequential. If source or restored VM/PVC provisioning exceeds
+the cluster-operation timeout, or guest readiness exceeds 15 minutes, that
+logical iteration is retried once with newly created VMs. Set
+`--ssh-vm-retries 0` to disable retries. A boot clone attempt also fails early
+after three related CDI pod restarts instead of waiting for the full operation
+timeout.
+
+The CDI clone retry is independent of `--ssh-vm-retries`. When the affected
+clone source pod reports `Unexpected status code 401`, the test captures
+diagnostics, removes that attempt, waits for the current CDI client signer to
+appear in its CA bundle, and recreates the full iteration. The default is one
+such recovery attempt; use `--cdi-clone-retries 0` to disable it. Other CDI or
+storage failures do not consume this retry budget.
 
 By default, a VM snapshot error may recover for up to 60 seconds before the
 iteration fails. The first error and any recovery are logged. Set
@@ -473,6 +485,11 @@ when possible.
   `--ssh-connect-timeout` to change each connection/banner timeout,
   `--ssh-vm-retries` to retry with fresh VMs, and
   `--keep-failed-resources` to retain the final failed attempt.
+- **A VM remains in `WaitingForVolumeBinding`:** inspect the DataVolume and CDI
+  pod diagnostics emitted before cleanup. `--ssh-vm-retries` also retries VM
+  and PVC provisioning failures with a fresh iteration, which avoids aborting a
+  long run for a transient provisioning failure. The known CDI clone HTTP 401
+  has a separate `--cdi-clone-retries` budget and is enabled by default.
 - **A guest operation reports an SSH transport failure:** increase
   `--ssh-timeout` if the API or `virtctl` tunnel is temporarily unstable. A
   valid checksum mismatch always fails immediately regardless of this setting.

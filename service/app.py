@@ -299,6 +299,20 @@ PARAMETERS = [
         ),
     },
     {
+        "key": "cdi_clone_retries",
+        "label": "CDI clone auth retries",
+        "type": "number",
+        "default": 1,
+        "min": 0,
+        "required": True,
+        "group": "Workload",
+        "modes": ["stress"],
+        "help": (
+            "Fresh iteration attempts when the affected CDI clone source pod "
+            "reports the known HTTP 401 certificate-rotation race."
+        ),
+    },
+    {
         "key": "ssh_user",
         "label": "SSH user",
         "type": "text",
@@ -344,8 +358,8 @@ PARAMETERS = [
         "group": "Guest access",
         "modes": ["stress"],
         "help": (
-            "Additional full iteration attempts with newly created VMs after source or "
-            "restored guest SSH readiness times out."
+            "Additional full iteration attempts with newly created VMs after VM/PVC "
+            "provisioning or guest SSH readiness times out."
         ),
     },
     {
@@ -585,6 +599,7 @@ def build_command(config: dict[str, Any]) -> list[str]:
             ("--root-data-size-gib", "root_data_size_gib"),
             ("--poll-interval", "poll_interval"),
             ("--snapshot-error-grace", "snapshot_error_grace"),
+            ("--cdi-clone-retries", "cdi_clone_retries"),
             ("--ssh-user", "ssh_user"),
             ("--ssh-timeout", "ssh_timeout"),
             ("--ssh-connect-timeout", "ssh_connect_timeout"),

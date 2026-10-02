@@ -47,6 +47,8 @@ TIMEOUT_SECONDS=3600
 SSH_TIMEOUT_SECONDS=900
 SSH_CONNECT_TIMEOUT_SECONDS=30
 SSH_VM_RETRIES=0
+CDI_CLONE_RETRIES=1
+CDI_CERT_SYNC_TIMEOUT_SECONDS=120
 POLL_INTERVAL_SECONDS=5
 SNAPSHOT_ERROR_GRACE_SECONDS=60
 KEEP_RESOURCES=false
@@ -125,8 +127,12 @@ Options:
   --ssh-connect-timeout SECONDS
                            Timeout for each SSH connection and banner exchange
                            (default: 30).
-  --ssh-vm-retries COUNT   Additional fresh iteration attempts after source or
-                           restored VM SSH readiness times out (default: 0).
+  --ssh-vm-retries COUNT   Additional fresh iteration attempts after VM/PVC
+                           provisioning or guest SSH readiness times out
+                           (default: 0).
+  --cdi-clone-retries COUNT
+                           Fresh iteration attempts after the CDI clone source
+                           pod reports the known HTTP 401 error (default: 1).
   --poll-interval SECONDS  Status polling interval (default: 5).
   --snapshot-error-grace SECONDS
                            Continue waiting this long after a VM snapshot reports
@@ -305,6 +311,10 @@ while (($# > 0)); do
 		SSH_VM_RETRIES="${2:-}"
 		shift 2
 		;;
+	--cdi-clone-retries)
+		CDI_CLONE_RETRIES="${2:-}"
+		shift 2
+		;;
 	--poll-interval)
 		POLL_INTERVAL_SECONDS="${2:-}"
 		shift 2
@@ -418,6 +428,7 @@ else
 	require_positive_integer "--ssh-timeout" "$SSH_TIMEOUT_SECONDS"
 	require_positive_integer "--ssh-connect-timeout" "$SSH_CONNECT_TIMEOUT_SECONDS"
 	require_non_negative_integer "--ssh-vm-retries" "$SSH_VM_RETRIES"
+	require_non_negative_integer "--cdi-clone-retries" "$CDI_CLONE_RETRIES"
 	require_positive_integer "--poll-interval" "$POLL_INTERVAL_SECONDS"
 	require_non_negative_integer "--snapshot-error-grace" "$SNAPSHOT_ERROR_GRACE_SECONDS"
 	((ROOT_DATA_SIZE_GIB < BOOT_SIZE_GIB)) ||
@@ -959,13 +970,20 @@ sha256sum "$payload_path" | cut -d " " -f1
 ' "$GUEST_DEVICE" "$GUEST_MOUNT_PATH" "$payload_name"
 }
 
-delete_resource() {
+delete_resource_checked() {
 	local resource="$1"
 	local name="$2"
+
 	[[ -n "$name" ]] || return 0
-	kubectl delete "$resource" "$name" -n "$NAMESPACE" \
-		--ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s" >/dev/null ||
+	if ! kubectl delete "$resource" "$name" -n "$NAMESPACE" \
+		--ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s" >/dev/null; then
 		log "WARNING: failed to delete ${resource}/${name}" >&2
+		return 1
+	fi
+}
+
+delete_resource() {
+	delete_resource_checked "$@" || true
 }
 
 label_boot_storage_resources() {
@@ -1161,24 +1179,31 @@ clear_iteration_state() {
 }
 
 cleanup_iteration() {
+	local cleanup_failed=false
+
 	[[ -n "$CURRENT_ITERATION" ]] || return 0
 	log "Cleaning resources from ${CURRENT_ITERATION}"
 
 	# VirtualMachineRestore defaults to deletionPolicy=delete. Stop and remove
 	# the target VM before deleting the restore CR and its restored PVCs.
-	delete_resource virtualmachines.kubevirt.io "$CURRENT_RESTORED_VM"
-	delete_resource virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE"
+	delete_resource_checked virtualmachines.kubevirt.io "$CURRENT_RESTORED_VM" || cleanup_failed=true
+	delete_resource_checked virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE" || cleanup_failed=true
 	# Remove the backup while the source VM and PVs still exist so the CSI driver
 	# can resolve snapshot topology and delete every backend snapshot.
-	delete_resource virtualmachinebackups.harvesterhci.io "$CURRENT_BACKUP"
-	delete_resource virtualmachines.kubevirt.io "$CURRENT_VM"
-	delete_resource datavolumes.cdi.kubevirt.io "$CURRENT_BOOT_PVC"
-	delete_resource pvc "$CURRENT_BOOT_PVC"
+	delete_resource_checked virtualmachinebackups.harvesterhci.io "$CURRENT_BACKUP" || cleanup_failed=true
+	delete_resource_checked virtualmachines.kubevirt.io "$CURRENT_VM" || cleanup_failed=true
+	delete_resource_checked datavolumes.cdi.kubevirt.io "$CURRENT_BOOT_PVC" || cleanup_failed=true
+	delete_resource_checked pvc "$CURRENT_BOOT_PVC" || cleanup_failed=true
 
-	kubectl delete pvc -n "$NAMESPACE" \
+	if ! kubectl delete pvc -n "$NAMESPACE" \
 		-l "${STRESS_RUN_LABEL}=${RUN_ID},${STRESS_ITERATION_LABEL}=${CURRENT_ITERATION}" \
-		--ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s" >/dev/null ||
+		--ignore-not-found --wait=true --timeout="${TIMEOUT_SECONDS}s" >/dev/null; then
 		log "WARNING: failed to delete one or more iteration PVCs" >&2
+		cleanup_failed=true
+	fi
+	if [[ "$cleanup_failed" == true ]]; then
+		return 1
+	fi
 
 	clear_iteration_state
 }
@@ -1208,6 +1233,30 @@ dump_object_events() {
 		--sort-by='.lastTimestamp' -o wide >&2 2>/dev/null || true
 }
 
+dump_cdi_pods() {
+	local pods=""
+	local pod=""
+
+	pods="$(kubectl get pods -n "$NAMESPACE" -l app=containerized-data-importer \
+		-o json 2>/dev/null | jq -r '.items[].metadata.name' 2>/dev/null || true)"
+	while IFS= read -r pod; do
+		[[ -n "$pod" ]] || continue
+		log "CDI diagnostic status: pod/${pod}" >&2
+		kubectl get pod "$pod" -n "$NAMESPACE" -o json 2>/dev/null |
+			jq '{metadata: {name: .metadata.name, namespace: .metadata.namespace,
+              labels: .metadata.labels, annotations: .metadata.annotations,
+              creationTimestamp: .metadata.creationTimestamp,
+              ownerReferences: .metadata.ownerReferences}, status: .status}' >&2 || true
+		log "Last 200 log lines from CDI pod/${pod}:" >&2
+		kubectl logs "$pod" -n "$NAMESPACE" --all-containers \
+			--tail=200 --timestamps --prefix >&2 2>/dev/null || true
+		log "Previous log lines from CDI pod/${pod}:" >&2
+		kubectl logs "$pod" -n "$NAMESPACE" --all-containers --previous \
+			--tail=200 --timestamps --prefix >&2 2>/dev/null || true
+		dump_object_events "$pod"
+	done <<<"$pods"
+}
+
 dump_iteration_diagnostics() {
 	local selector="${STRESS_RUN_LABEL}=${RUN_ID},${STRESS_ITERATION_LABEL}=${CURRENT_ITERATION}"
 	local launcher_pods=""
@@ -1234,6 +1283,8 @@ dump_iteration_diagnostics() {
 	dump_named_resource virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE"
 	dump_named_resource virtualmachines.kubevirt.io "$CURRENT_RESTORED_VM"
 	dump_named_resource virtualmachineinstances.kubevirt.io "$CURRENT_RESTORED_VM"
+	dump_named_resource datavolumes.cdi.kubevirt.io "$CURRENT_BOOT_PVC"
+	dump_cdi_pods
 
 	launcher_pods="$(kubectl get pods -n "$NAMESPACE" -o json 2>/dev/null |
 		jq -r --arg source "$CURRENT_VM" --arg restored "$CURRENT_RESTORED_VM" '
@@ -1278,6 +1329,7 @@ dump_iteration_diagnostics() {
 	while IFS= read -r claim; do
 		[[ -n "$claim" ]] || continue
 		dump_named_resource pvc "$claim"
+		dump_object_events "$claim"
 		pv="$(kubectl get pvc "$claim" -n "$NAMESPACE" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
 		if [[ -n "$pv" ]]; then
 			log "Diagnostic YAML: persistentvolume/${pv}" >&2
@@ -1299,6 +1351,129 @@ dump_iteration_diagnostics() {
 		dump_object_events "$pod"
 	done
 	log "Finished diagnostics for ${CURRENT_ITERATION}" >&2
+}
+
+cdi_clone_source_pod() {
+	local pvc="$1"
+
+	kubectl get pvc "$pvc" -n "$NAMESPACE" -o json 2>/dev/null |
+		jq -r '.metadata.annotations["cdi.kubevirt.io/storage.sourceClonePodName"] // empty'
+}
+
+cdi_clone_auth_failed() {
+	local pvc="$1"
+	local pod=""
+	local logs=""
+	local previous_logs=""
+
+	pod="$(cdi_clone_source_pod "$pvc" || true)"
+	[[ -n "$pod" ]] || return 1
+
+	logs="$(kubectl logs "$pod" -n "$NAMESPACE" --all-containers \
+		--tail=200 2>/dev/null || true)"
+	previous_logs="$(kubectl logs "$pod" -n "$NAMESPACE" --all-containers \
+		--previous --tail=200 2>/dev/null || true)"
+	if [[ "$logs" != *"Unexpected status code 401"* &&
+		"$previous_logs" != *"Unexpected status code 401"* ]]; then
+		return 1
+	fi
+
+	log "Detected CDI clone authentication failure in pod ${NAMESPACE}/${pod}" >&2
+	return 0
+}
+
+cdi_signer_ready() {
+	local signer=""
+	local signer_namespace=""
+	local signer_data=""
+	local signer_cert=""
+	local bundle=""
+
+	signer="$(kubectl get secret -A \
+		--field-selector metadata.name=cdi-uploadserver-client-signer \
+		-o json 2>/dev/null | jq -r '
+          [.items[] | select(.data["tls.crt"] != null)][0]
+          | if . == null then empty
+            else [.metadata.namespace, .data["tls.crt"]] | @tsv
+            end
+        ' 2>/dev/null || true)"
+	[[ -n "$signer" ]] || return 1
+	IFS=$'\t' read -r signer_namespace signer_data <<<"$signer"
+	[[ -n "$signer_namespace" && -n "$signer_data" ]] || return 1
+
+	signer_cert="$(printf '%s' "$signer_data" | base64 --decode 2>/dev/null)" ||
+		return 1
+	bundle="$(kubectl get configmap cdi-uploadserver-client-signer-bundle \
+		-n "$signer_namespace" -o json 2>/dev/null |
+		jq -r '.data["ca-bundle.crt"] // empty' 2>/dev/null || true)"
+	[[ -n "$bundle" && "$bundle" == *"$signer_cert"* ]]
+}
+
+wait_for_cdi_signer() {
+	local deadline=$((SECONDS + CDI_CERT_SYNC_TIMEOUT_SECONDS))
+
+	log "Waiting for the CDI client signer bundle to contain the current signer"
+	while ((SECONDS < deadline)); do
+		if cdi_signer_ready; then
+			log "CDI client signer bundle is synchronized"
+			return 0
+		fi
+		sleep "$POLL_INTERVAL_SECONDS"
+	done
+
+	log "ERROR: CDI client signer bundle did not synchronize within ${CDI_CERT_SYNC_TIMEOUT_SECONDS}s" >&2
+	return 1
+}
+
+retry_iteration() {
+	local worker="$1"
+	local iteration="$2"
+	local attempt="$3"
+	local vm_retries="$4"
+	local cdi_retries="$5"
+	local retry_kind="$6"
+	local reason="$7"
+	local next_vm_retries="$vm_retries"
+	local next_cdi_retries="$cdi_retries"
+	local max_attempts=$((SSH_VM_RETRIES + CDI_CLONE_RETRIES + 1))
+
+	dump_iteration_diagnostics || true
+	case "$retry_kind" in
+	cdi)
+		if ((cdi_retries >= CDI_CLONE_RETRIES)); then
+			log "CDI clone retry budget exhausted for iteration ${iteration}" >&2
+			return 1
+		fi
+		next_cdi_retries=$((cdi_retries + 1))
+		;;
+	vm)
+		if ((vm_retries >= SSH_VM_RETRIES)); then
+			return 1
+		fi
+		next_vm_retries=$((vm_retries + 1))
+		;;
+	*)
+		log "ERROR: unknown iteration retry kind: ${retry_kind@Q}" >&2
+		return 1
+		;;
+	esac
+
+	log "${reason}; retrying iteration ${iteration} with a fresh VM (attempt $((attempt + 1))/${max_attempts})" >&2
+	if ! cleanup_iteration; then
+		log "ERROR: unable to clean attempt ${attempt}; not starting a conflicting retry" >&2
+		return 1
+	fi
+	if [[ "$retry_kind" == cdi ]] && ! wait_for_cdi_signer; then
+		return 1
+	fi
+	if run_iteration "$worker" "$iteration" "$((attempt + 1))" \
+		"$next_vm_retries" "$next_cdi_retries"; then
+		if [[ "$retry_kind" == cdi ]]; then
+			log "Recovered iteration ${iteration} after a CDI clone authentication retry"
+		fi
+		return 0
+	fi
+	return 1
 }
 
 dump_diagnostics() {
@@ -1383,7 +1558,9 @@ log "Run ID: ${RUN_ID}"
 log "Boot PVC: ${BOOT_SIZE_GIB}Gi ${BOOT_VOLUME_MODE} ${BOOT_ACCESS_MODE} on ${IMAGE_STORAGE_CLASS}"
 log "Data PVC: ${DATA_VOLUME_SIZE_GIB}Gi ${DATA_VOLUME_MODE} ${DATA_ACCESS_MODE} on ${DATA_STORAGE_CLASS}"
 log "VM network: ${NETWORK_NAME}; guest interface: ${GUEST_INTERFACE_NAME}"
-log "Timeouts: cluster operations ${TIMEOUT_SECONDS}s; snapshot error grace ${SNAPSHOT_ERROR_GRACE_SECONDS}s; guest SSH readiness/operation retries ${SSH_TIMEOUT_SECONDS}s; SSH connect ${SSH_CONNECT_TIMEOUT_SECONDS}s; fresh VM retries ${SSH_VM_RETRIES}"
+log "Timeouts: cluster operations ${TIMEOUT_SECONDS}s; snapshot error grace ${SNAPSHOT_ERROR_GRACE_SECONDS}s"
+log "SSH timeout: ${SSH_TIMEOUT_SECONDS}s; SSH connect: ${SSH_CONNECT_TIMEOUT_SECONDS}s"
+log "Retry budgets: fresh VM ${SSH_VM_RETRIES}; CDI clone authentication ${CDI_CLONE_RETRIES}"
 
 log "Creating VirtualMachineImage ${NAMESPACE}/${IMAGE_NAME}"
 jq -n \
@@ -1586,9 +1763,13 @@ run_iteration() {
 	local worker="$1"
 	local iteration="$2"
 	local attempt="${3:-1}"
-	local max_attempts=$((SSH_VM_RETRIES + 1))
+	local vm_retries="${4:-0}"
+	local cdi_retries="${5:-0}"
+	local max_attempts=$((SSH_VM_RETRIES + CDI_CLONE_RETRIES + 1))
 	local attempt_suffix=""
 	local iteration_id=""
+	local retry_kind="vm"
+	local retry_reason=""
 	local VM_JSON=""
 	local DATA_PVC_NAME=""
 	local ROOT_PAYLOAD_NAME=""
@@ -1622,19 +1803,46 @@ run_iteration() {
 	log "Starting iteration ${iteration}/${ITERATIONS} (attempt ${attempt}/${max_attempts})"
 	log "Creating VM ${NAMESPACE}/${CURRENT_VM}"
 	create_iteration_vm "$iteration_id" "$VM_JSON"
-	CURRENT_FAILURE_CATEGORY="vm-readiness-failure"
-	wait_for_resource virtualmachines.kubevirt.io "$CURRENT_VM" '.status.ready == true' "source VM"
 	CURRENT_FAILURE_CATEGORY="storage-provisioning-failure"
-	wait_for_resource pvc "$CURRENT_BOOT_PVC" '.status.phase == "Bound"' "block boot PVC"
+	if ! wait_for_resource pvc "$CURRENT_BOOT_PVC" '.status.phase == "Bound"' \
+		"block boot PVC" \
+		'((.metadata.annotations["cdi.kubevirt.io/storage.pod.restarts"] // "0") | tonumber? // 0) >= 3'; then
+		retry_reason="Boot PVC provisioning failed for source VM ${CURRENT_VM}"
+		if cdi_clone_auth_failed "$CURRENT_BOOT_PVC"; then
+			CURRENT_FAILURE_CATEGORY="cdi-clone-auth-failure"
+			retry_kind="cdi"
+			retry_reason="CDI clone source pod returned HTTP 401"
+		fi
+		if retry_iteration "$worker" "$iteration" "$attempt" \
+			"$vm_retries" "$cdi_retries" "$retry_kind" "$retry_reason"; then
+			return 0
+		fi
+		return 1
+	fi
 	label_boot_storage_resources "$CURRENT_BOOT_PVC" "$iteration_id"
-	wait_for_resource pvc "$DATA_PVC_NAME" '.status.phase == "Bound"' "filesystem data PVC"
+	if ! wait_for_resource pvc "$DATA_PVC_NAME" '.status.phase == "Bound"' "filesystem data PVC"; then
+		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
+			"$cdi_retries" vm \
+			"Data PVC provisioning failed for source VM ${CURRENT_VM}"; then
+			return 0
+		fi
+		return 1
+	fi
+	CURRENT_FAILURE_CATEGORY="vm-readiness-failure"
+	if ! wait_for_resource virtualmachines.kubevirt.io "$CURRENT_VM" '.status.ready == true' "source VM"; then
+		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
+			"$cdi_retries" vm \
+			"VM readiness failed for source VM ${CURRENT_VM}"; then
+			return 0
+		fi
+		return 1
+	fi
+	CURRENT_FAILURE_CATEGORY="guest-readiness-failure"
 	if ! wait_for_guest_ssh "$CURRENT_VM"; then
-		dump_iteration_diagnostics || true
-		if ((attempt < max_attempts)); then
-			log "Guest readiness failed for source VM ${CURRENT_VM}; retrying iteration ${iteration} with a fresh VM (attempt $((attempt + 1))/${max_attempts})" >&2
-			cleanup_iteration
-			run_iteration "$worker" "$iteration" "$((attempt + 1))"
-			return
+		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
+			"$cdi_retries" vm \
+			"Guest readiness failed for source VM ${CURRENT_VM}"; then
+			return 0
 		fi
 		return 1
 	fi
@@ -1716,21 +1924,36 @@ run_iteration() {
     ' | kubectl apply -f - >/dev/null
 	wait_for_resource virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE" \
 		'.status.complete == true' "VM restore" '.status.error.message? != null'
-	wait_for_resource virtualmachines.kubevirt.io "$CURRENT_RESTORED_VM" '.status.ready == true' "restored VM"
+	CURRENT_FAILURE_CATEGORY="restored-vm-readiness-failure"
+	if ! wait_for_resource virtualmachines.kubevirt.io "$CURRENT_RESTORED_VM" '.status.ready == true' "restored VM"; then
+		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
+			"$cdi_retries" vm \
+			"VM readiness failed for restored VM ${CURRENT_RESTORED_VM}"; then
+			return 0
+		fi
+		return 1
+	fi
 	label_restored_resources "$CURRENT_RESTORED_VM" "$iteration_id"
 
 	RESTORED_DATA_PVC="$(kubectl get virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE" -n "$NAMESPACE" -o json | jq -r --arg volume "$DATA_VOLUME_NAME" '
       [.status.restores[]? | select(.volumeName == $volume)][0].persistentVolumeClaimSpec.metadata.name // empty
     ')"
 	[[ -n "$RESTORED_DATA_PVC" ]] || fail "restore status does not contain a PVC for VM volume ${DATA_VOLUME_NAME}"
-	wait_for_resource pvc "$RESTORED_DATA_PVC" '.status.phase == "Bound"' "restored filesystem data PVC"
+	CURRENT_FAILURE_CATEGORY="restored-storage-provisioning-failure"
+	if ! wait_for_resource pvc "$RESTORED_DATA_PVC" '.status.phase == "Bound"' "restored filesystem data PVC"; then
+		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
+			"$cdi_retries" vm \
+			"Data PVC provisioning failed for restored VM ${CURRENT_RESTORED_VM}"; then
+			return 0
+		fi
+		return 1
+	fi
+	CURRENT_FAILURE_CATEGORY="restored-guest-readiness-failure"
 	if ! wait_for_guest_ssh "$CURRENT_RESTORED_VM"; then
-		dump_iteration_diagnostics || true
-		if ((attempt < max_attempts)); then
-			log "Guest readiness failed for restored VM ${CURRENT_RESTORED_VM}; retrying iteration ${iteration} with a fresh source VM (attempt $((attempt + 1))/${max_attempts})" >&2
-			cleanup_iteration
-			run_iteration "$worker" "$iteration" "$((attempt + 1))"
-			return
+		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
+			"$cdi_retries" vm \
+			"Guest readiness failed for restored VM ${CURRENT_RESTORED_VM}"; then
+			return 0
 		fi
 		return 1
 	fi
