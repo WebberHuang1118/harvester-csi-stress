@@ -10,17 +10,18 @@ iterations sequentially inside each worker. For example, `--parallel 3
 
 During each iteration, the test:
 
-1. Generates and creates a minimal KubeVirt VM with boot and data PVCs.
-2. Waits for the VM, both PVCs, and guest SSH access. Guest readiness uses a
+1. Generates and creates a minimal KubeVirt VM with one boot PVC and the
+   requested number of identical data PVCs.
+2. Waits for the VM, every PVC, and guest SSH access. Guest readiness uses a
    dedicated timeout and can optionally retry the entire iteration with fresh
    VMs. A CDI clone source HTTP 401 gets its own fresh-iteration retry budget.
-3. Writes random payloads to the root filesystem and data disk and records their
-   SHA-256 checksums.
+3. Writes random payloads to the root filesystem and every data disk and records
+   their SHA-256 checksums.
 4. Creates a Harvester `VirtualMachineBackup` with filesystem freeze enabled.
    Transient snapshot errors remain visible in the log, but the test allows a
    bounded recovery window for the snapshot controller's automatic retries.
 5. Stops the source VM and restores the backup as a new VM.
-6. Recalculates both checksums on the restored VM and verifies data integrity.
+6. Recalculates every checksum on the restored VM and verifies data integrity.
    Checksum retrieval retries transient SSH/`virtctl` transport failures
    without retrying or hiding a valid checksum mismatch.
 7. Removes the iteration resources unless resource retention is enabled.
@@ -52,8 +53,8 @@ The cloud image must support cloud-init, the selected SSH user, passwordless
 
 An exported VM or reference manifest is not required. The script generates a
 KubeVirt VM with `amd64` architecture, a `q35` machine, `virtio` disks and
-networking, `RerunOnFailure`, ACPI, inline cloud-init, two PVC templates, and
-optional node affinity.
+networking, `RerunOnFailure`, ACPI, inline cloud-init, generated PVC templates,
+and optional node affinity.
 
 ## Browser GUI
 
@@ -193,8 +194,8 @@ Select **Stress test**, review the fields, and choose **Start stress test**. The
 GUI exposes every supported stress-test parameter in these groups:
 
 - **Cluster connection:** Kubeconfig, namespace, and per-operation cluster timeout
-- **VM and storage:** image URL, image/data storage classes, CPU, memory, PVC
-  capacities, volume modes, and access modes
+- **VM and storage:** image URL, image/data storage classes, CPU, memory, data
+  disk count, PVC capacities, volume modes, and access modes
 - **VM network:** Multus network, guest interface name, and required node selector
 - **Workload:** iterations per worker, parallel workers, root/data payload sizes,
   polling interval, snapshot error grace, and CDI clone authentication retries
@@ -202,7 +203,7 @@ GUI exposes every supported stress-test parameter in these groups:
   data device, mount path, and resource retention
 
 The image storage class is used for both the Harvester VM image and every
-boot/root PVC. The data storage class is used for the additional data PVC.
+boot/root PVC. The data storage class is used for every additional data PVC.
 There is no separate boot storage-class setting.
 
 The image URL, image storage class, and data storage class are required and have
@@ -217,17 +218,17 @@ Important GUI and CLI defaults are:
 | SSH retry timeout / connect timeout / fresh VM retries | `900` seconds / `30` seconds / `0` |
 | vCPU / memory | `2` / `4Gi` |
 | Boot PVC | `50Gi`, `Block`, `ReadWriteOnce` |
-| Data PVC | `100Gi`, `Filesystem`, `ReadWriteOnce` |
+| Data PVCs | `1` disk, each `100Gi`, `Filesystem`, `ReadWriteOnce` |
 | Multus network | `default/mgmt-vlan` |
 | Guest interface | `enp1s0` |
 | Required node selector | `network.harvesterhci.io/mgmt=true` |
 | Iterations / parallel workers | `1` / `1` |
-| Root / data payload | `1Gi` / `10Gi` |
+| Root / per-data-disk payload | `1Gi` / `10Gi` |
 | Polling interval | `5` seconds |
 | Snapshot error grace | `60` seconds |
 | CDI clone authentication retries | `1` |
 | SSH user | `ubuntu` |
-| Guest data device / mount | `/dev/vdb` / `/mnt/csi-stress` |
+| Single data-disk device / mount | `/dev/vdb` / `/mnt/csi-stress` |
 | Keep all resources / keep failed resources | Disabled / disabled |
 
 The GUI validates values before launching the process. In particular:
@@ -320,6 +321,7 @@ NAMESPACE="default"
   --cpu 2 \
   --memory 4Gi \
   --boot-size-gib 50 \
+  --data-volume-count 1 \
   --data-volume-size-gib 100 \
   --boot-volume-mode Block \
   --data-volume-mode Filesystem \
@@ -353,6 +355,24 @@ logical iteration is retried once with newly created VMs. Set
 `--ssh-vm-retries 0` to disable retries. A boot clone attempt also fails early
 after three related CDI pod restarts instead of waiting for the full operation
 timeout.
+
+`--data-volume-count` counts data disks only. Each disk uses the same
+`--data-volume-size-gib`, `--data-volume-mode`, and `--data-access-mode` values,
+and receives an independent payload of `--data-size-gib`. For example, this
+configuration creates 16 VM volumes in total and verifies all 15 data disks:
+
+```bash
+--data-volume-count 15 \
+--data-volume-size-gib 5 \
+--data-volume-mode Block \
+--data-access-mode ReadWriteOnce \
+--data-size-gib 1
+```
+
+With one data disk, `--guest-device` and `--guest-mount-path` retain their
+existing meanings. With multiple disks, the generated virtio serials identify
+the devices reliably after restore, and the disks are mounted below
+`--guest-mount-path` as `disk-1` through `disk-N`.
 
 The CDI clone retry is independent of `--ssh-vm-retries`. When the affected
 clone source pod reports `Unexpected status code 401`, the test captures
@@ -441,13 +461,15 @@ when possible.
 - PVC capacity and payload size are different settings. The payload must be
   smaller than the PVC, and the root disk must also have room for the guest OS,
   packages, logs, and filesystem metadata.
-- Capacity usage scales with `--parallel` because every worker can have a source
-  VM, snapshots, and restored storage at the same time.
-- The data disk is formatted as ext4 inside the guest when it has no existing
+- Capacity usage scales with both `--parallel` and `--data-volume-count` because
+  every worker can have a source VM, snapshots, and restored storage at the same
+  time.
+- Every data disk is formatted as ext4 inside the guest when it has no existing
   filesystem signature. The script refuses to format the root device or a disk
   with an unexpected signature.
-- The default guest data device is `/dev/vdb`; verify the device name for custom
-  images before running large payloads.
+- The default single-disk guest device is `/dev/vdb`; verify the device name for
+  custom images. Multi-disk runs use generated virtio serials instead of Linux
+  enumeration order.
 - Cloud-init enables DHCP on the selected guest interface, installs
   `qemu-guest-agent`, injects the selected SSH public key, enables password SSH,
   and sets the temporary password `password1234`. Use an isolated test network,

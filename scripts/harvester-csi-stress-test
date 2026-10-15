@@ -9,8 +9,8 @@ readonly STRESS_RUN_LABEL="csi.harvesterhci.io/stress-run"
 readonly STRESS_ITERATION_LABEL="csi.harvesterhci.io/stress-iteration"
 readonly CLOUD_INIT_PASSWORD="password1234"
 readonly BOOT_TEMPLATE_INDEX=0
-readonly DATA_TEMPLATE_INDEX=1
-readonly DATA_VOLUME_NAME="data-disk"
+readonly DATA_VOLUME_PREFIX="data-disk"
+readonly DATA_DISK_SERIAL_PREFIX="csi-data"
 
 NAMESPACE="default"
 KUBECONFIG_PATH="${KUBECONFIG:-}"
@@ -21,6 +21,7 @@ DATA_STORAGE_CLASS=""
 CPU=""
 MEMORY=""
 BOOT_SIZE_GIB=50
+DATA_VOLUME_COUNT=1
 DATA_VOLUME_SIZE_GIB=100
 BOOT_VOLUME_MODE="Block"
 DATA_VOLUME_MODE="Filesystem"
@@ -104,8 +105,10 @@ Options:
   --kubeconfig PATH        Kubeconfig file to use. Defaults to the KUBECONFIG
                            environment variable, then Kubernetes' standard lookup.
   --boot-size-gib COUNT    Boot PVC capacity in GiB (default: 50).
+  --data-volume-count COUNT
+                           Number of identical data PVCs per VM (default: 1).
   --data-volume-size-gib COUNT
-                           Data PVC capacity in GiB (default: 100).
+                           Capacity of each data PVC in GiB (default: 100).
   --boot-volume-mode MODE  Boot PVC mode: Block or Filesystem (default: Block).
   --data-volume-mode MODE  Data PVC mode: Block or Filesystem (default: Filesystem).
   --boot-access-mode MODE  Boot PVC access mode (default: ReadWriteOnce).
@@ -118,7 +121,8 @@ Options:
                            Required VM node selector. Pass an empty value to disable
                            (default: network.harvesterhci.io/mgmt=true).
   --parallel COUNT         Number of concurrent VM workflow workers (default: 1).
-  --data-size-gib COUNT    Random payload size in GiB (default: 10).
+  --data-size-gib COUNT    Random payload size written to each data disk in GiB
+                           (default: 10).
   --root-data-size-gib COUNT
                            Random root-disk payload size in GiB (default: 1).
   --timeout SECONDS        Timeout for each asynchronous operation (default: 3600).
@@ -141,8 +145,11 @@ Options:
   --ssh-user USER          Cloud image's default SSH user (default: ubuntu).
   --ssh-identity-file PATH Existing unencrypted private key to inject and use.
                            By default, the script generates an ephemeral key.
-  --guest-device PATH      Guest data disk device (default: /dev/vdb).
-  --guest-mount-path PATH  Guest mount point (default: /mnt/csi-stress).
+  --guest-device PATH      Guest data disk device when --data-volume-count is 1
+                           (default: /dev/vdb). Multi-disk runs resolve disks by
+                           their generated virtio serials.
+  --guest-mount-path PATH  Guest mount point for one data disk, or base directory
+                           for multiple disks (default: /mnt/csi-stress).
   --keep-resources         Do not remove resources created by the script.
   --keep-failed-resources  Retain only the failed iteration and shared image for
                            diagnostics; successful iterations are still removed.
@@ -154,6 +161,10 @@ The script creates a minimal KubeVirt VM manifest and VMImage for each run. For
 example, --iterations 10 --parallel 3 starts three concurrent workers. Each
 worker runs ten VM, snapshot, restore, and integrity-check cycles (30 total).
 Parallel execution requires Bash 5.1 or newer.
+
+Each data disk receives the same capacity, volume mode, access mode, and payload
+size. For example, --data-volume-count 15 creates 16 PVCs per VM: one boot PVC
+and 15 data PVCs.
 
 Cloud-init configures DHCP on --guest-interface-name and installs
 qemu-guest-agent. The script uses virtctl ssh and requires passwordless sudo, as
@@ -203,6 +214,53 @@ resource_name() {
 	printf '%s\n' "$value"
 }
 
+data_volume_name() {
+	local index="$1"
+
+	printf '%s-%s\n' "$DATA_VOLUME_PREFIX" "$index"
+}
+
+data_pvc_name() {
+	local vm_name="$1"
+	local index="$2"
+
+	printf '%s-pvc-%s\n' "$vm_name" "$index"
+}
+
+data_disk_serial() {
+	local index="$1"
+
+	printf '%s-%s\n' "$DATA_DISK_SERIAL_PREFIX" "$index"
+}
+
+guest_data_device() {
+	local index="$1"
+
+	if ((DATA_VOLUME_COUNT == 1)); then
+		printf '%s\n' "$GUEST_DEVICE"
+		return
+	fi
+	printf '/dev/disk/by-id/virtio-%s\n' "$(data_disk_serial "$index")"
+}
+
+guest_data_mount() {
+	local index="$1"
+
+	if ((DATA_VOLUME_COUNT == 1)); then
+		printf '%s\n' "$GUEST_MOUNT_PATH"
+		return
+	fi
+	printf '%s/disk-%s\n' "${GUEST_MOUNT_PATH%/}" "$index"
+}
+
+expected_volume_names() {
+	jq -nc \
+		--arg dataPrefix "$DATA_VOLUME_PREFIX" \
+		--argjson dataCount "$DATA_VOLUME_COUNT" '
+      ["boot-disk"] + [range(1; $dataCount + 1) | ($dataPrefix + "-" + tostring)]
+    '
+}
+
 while (($# > 0)); do
 	case "$1" in
 	--image-url)
@@ -227,6 +285,10 @@ while (($# > 0)); do
 		;;
 	--boot-size-gib)
 		BOOT_SIZE_GIB="${2:-}"
+		shift 2
+		;;
+	--data-volume-count)
+		DATA_VOLUME_COUNT="${2:-}"
 		shift 2
 		;;
 	--data-volume-size-gib)
@@ -421,6 +483,7 @@ else
 	require_positive_integer "--iterations" "$ITERATIONS"
 	require_positive_integer "--parallel" "$PARALLEL"
 	require_positive_integer "--boot-size-gib" "$BOOT_SIZE_GIB"
+	require_positive_integer "--data-volume-count" "$DATA_VOLUME_COUNT"
 	require_positive_integer "--data-volume-size-gib" "$DATA_VOLUME_SIZE_GIB"
 	require_positive_integer "--data-size-gib" "$DATA_SIZE_GIB"
 	require_positive_integer "--root-data-size-gib" "$ROOT_DATA_SIZE_GIB"
@@ -847,6 +910,8 @@ sha256sum "$payload_path" | cut -d " " -f1
 write_guest_payload() {
 	local vm_name="$1"
 	local payload_name="$2"
+	local device="$3"
+	local mount_path="$4"
 	local size_mib=$((DATA_SIZE_GIB * 1024))
 
 	run_guest_script_with_transport_retry "source data-disk payload write" "$vm_name" 'set -Eeuo pipefail
@@ -873,7 +938,7 @@ if lsblk -sno PATH "$root_source" | grep -Fxq "$device_real"; then
 fi
 
 set +e
-fs_type="$(blkid -p -s TYPE -o value "$device" 2>/dev/null)"
+fs_type="$(blkid -p -s TYPE -o value "$device_real" 2>/dev/null)"
 blkid_exit_code=$?
 set -e
 case "$blkid_exit_code" in
@@ -884,12 +949,12 @@ case "$blkid_exit_code" in
   fi
   ;;
 2)
-  signatures="$(wipefs --no-act --noheadings --output TYPE "$device")"
+  signatures="$(wipefs --no-act --noheadings --output TYPE "$device_real")"
   if [[ -n "${signatures//[[:space:]]/}" ]]; then
     echo "guest data device has an unrecognized signature; refusing to format" >&2
     exit 1
   fi
-  mkfs.ext4 -F "$device" >&2
+  mkfs.ext4 -F "$device_real" >&2
   ;;
 8)
   echo "guest data device has ambiguous signatures; refusing to format" >&2
@@ -902,7 +967,7 @@ case "$blkid_exit_code" in
 esac
 
 mkdir -p "$mount_path"
-existing_target="$(findmnt -rn -S "$device" -o TARGET | head -n 1 || true)"
+existing_target="$(findmnt -rn -S "$device_real" -o TARGET | head -n 1 || true)"
 if [[ -n "$existing_target" && "$existing_target" != "$mount_path" ]]; then
   echo "guest data device is already mounted at $existing_target" >&2
   exit 1
@@ -914,7 +979,7 @@ if mountpoint -q "$mount_path"; then
     exit 1
   fi
 else
-  mount "$device" "$mount_path"
+  mount "$device_real" "$mount_path"
 fi
 
 payload_path="${mount_path}/${payload_name}"
@@ -927,12 +992,14 @@ fi
 dd if=/dev/urandom of="$payload_path" bs=1M count="$size_mib" conv=fsync status=none >&2
 sync
 sha256sum "$payload_path" | cut -d " " -f1
-' "$GUEST_DEVICE" "$GUEST_MOUNT_PATH" "$payload_name" "$size_mib"
+' "$device" "$mount_path" "$payload_name" "$size_mib"
 }
 
 read_guest_payload() {
 	local vm_name="$1"
 	local payload_name="$2"
+	local device="$3"
+	local mount_path="$4"
 
 	run_guest_script_with_transport_retry "restored data-disk checksum" "$vm_name" 'set -Eeuo pipefail
 
@@ -945,11 +1012,11 @@ for command in blkid cut findmnt head mkdir mount mountpoint readlink sha256sum;
 done
 test -b "$device" || { echo "guest data device is not a block device: $device" >&2; exit 1; }
 device_real="$(readlink -f "$device")"
-fs_type="$(blkid -p -s TYPE -o value "$device")"
+fs_type="$(blkid -p -s TYPE -o value "$device_real")"
 [[ "$fs_type" == "ext4" ]] || { echo "restored guest data device is not ext4: $fs_type" >&2; exit 1; }
 
 mkdir -p "$mount_path"
-existing_target="$(findmnt -rn -S "$device" -o TARGET | head -n 1 || true)"
+existing_target="$(findmnt -rn -S "$device_real" -o TARGET | head -n 1 || true)"
 if [[ -n "$existing_target" && "$existing_target" != "$mount_path" ]]; then
   echo "restored guest data device is already mounted at $existing_target" >&2
   exit 1
@@ -961,13 +1028,40 @@ if mountpoint -q "$mount_path"; then
     exit 1
   fi
 else
-  mount "$device" "$mount_path"
+  mount "$device_real" "$mount_path"
 fi
 
 payload_path="${mount_path}/${payload_name}"
 test -f "$payload_path" || { echo "restored payload not found: $payload_path" >&2; exit 1; }
 sha256sum "$payload_path" | cut -d " " -f1
-' "$GUEST_DEVICE" "$GUEST_MOUNT_PATH" "$payload_name"
+' "$device" "$mount_path" "$payload_name"
+}
+
+verify_status_volumes() {
+	local resource="$1"
+	local name="$2"
+	local status_field="$3"
+	local description="$4"
+	local expected=""
+	local expected_list=""
+	local object=""
+	local actual=""
+
+	expected="$(expected_volume_names)"
+	object="$(kubectl get "$resource" "$name" -n "$NAMESPACE" -o json)"
+	if jq -e --arg field "$status_field" --argjson expected "$expected" '
+      ([.status[$field][]?.volumeName] | sort) == ($expected | sort)
+    ' <<<"$object" >/dev/null; then
+		log "${description} contains all $((DATA_VOLUME_COUNT + 1)) expected VM volumes"
+		return
+	fi
+
+	actual="$(jq -r --arg field "$status_field" '
+      [.status[$field][]?.volumeName] | sort | join(", ")
+    ' <<<"$object")"
+	expected_list="$(jq -r 'join(", ")' <<<"$expected")"
+	fail "${description} volume set is incomplete:" \
+		"expected ${expected_list}; got ${actual:-none}"
 }
 
 delete_resource_checked() {
@@ -1556,7 +1650,9 @@ kubectl get network-attachment-definitions.k8s.cni.cncf.io "$NETWORK_RESOURCE_NA
 
 log "Run ID: ${RUN_ID}"
 log "Boot PVC: ${BOOT_SIZE_GIB}Gi ${BOOT_VOLUME_MODE} ${BOOT_ACCESS_MODE} on ${IMAGE_STORAGE_CLASS}"
-log "Data PVC: ${DATA_VOLUME_SIZE_GIB}Gi ${DATA_VOLUME_MODE} ${DATA_ACCESS_MODE} on ${DATA_STORAGE_CLASS}"
+log "Data PVCs: ${DATA_VOLUME_COUNT} x ${DATA_VOLUME_SIZE_GIB}Gi" \
+	"${DATA_VOLUME_MODE} ${DATA_ACCESS_MODE} on ${DATA_STORAGE_CLASS}"
+log "Payloads: ${ROOT_DATA_SIZE_GIB}Gi on root; ${DATA_SIZE_GIB}Gi on each data disk"
 log "VM network: ${NETWORK_NAME}; guest interface: ${GUEST_INTERFACE_NAME}"
 log "Timeouts: cluster operations ${TIMEOUT_SECONDS}s; snapshot error grace ${SNAPSHOT_ERROR_GRACE_SECONDS}s"
 log "SSH timeout: ${SSH_TIMEOUT_SECONDS}s; SSH connect: ${SSH_CONNECT_TIMEOUT_SECONDS}s"
@@ -1626,16 +1722,26 @@ create_iteration_vm() {
 		--arg dataVolumeMode "$DATA_VOLUME_MODE" \
 		--arg bootAccessMode "$BOOT_ACCESS_MODE" \
 		--arg dataAccessMode "$DATA_ACCESS_MODE" \
+		--arg dataVolumePrefix "$DATA_VOLUME_PREFIX" \
+		--arg dataSerialPrefix "$DATA_DISK_SERIAL_PREFIX" \
 		--arg networkName "$NETWORK_NAME" \
 		--arg nodeSelectorKey "$NODE_SELECTOR_KEY" \
 		--arg nodeSelectorValue "$NODE_SELECTOR_VALUE" \
 		--arg cloudInitUserData "$CLOUD_INIT_USER_DATA" \
 		--arg cloudInitNetworkData "$CLOUD_INIT_NETWORK_DATA" \
 		--arg memory "$MEMORY" \
-		--argjson cpu "$CPU" '
+		--argjson cpu "$CPU" \
+		--argjson dataVolumeCount "$DATA_VOLUME_COUNT" '
     ($vm + "-pvc-0") as $bootPVC
-    | ($vm + "-pvc-1") as $dataPVC
     | [
+        range(1; $dataVolumeCount + 1) as $index
+        | {
+            volumeName: ($dataVolumePrefix + "-" + ($index | tostring)),
+            pvcName: ($vm + "-pvc-" + ($index | tostring)),
+            serial: ($dataSerialPrefix + "-" + ($index | tostring))
+          }
+      ] as $dataVolumes
+    | ([
         {
           metadata: {
             name: $bootPVC,
@@ -1648,10 +1754,12 @@ create_iteration_vm() {
             volumeMode: $bootVolumeMode,
             storageClassName: $bootStorageClass
           }
-        },
-        {
+        }
+      ] + [
+        $dataVolumes[]
+        | {
           metadata: {
-            name: $dataPVC,
+            name: .pvcName,
             labels: {($runLabel): $run, ($iterationLabel): $iteration}
           },
           spec: {
@@ -1661,7 +1769,7 @@ create_iteration_vm() {
             storageClassName: $dataStorageClass
           }
         }
-      ] as $volumeTemplates
+      ]) as $volumeTemplates
     | {
         apiVersion: "kubevirt.io/v1",
         kind: "VirtualMachine",
@@ -1694,11 +1802,14 @@ create_iteration_vm() {
               domain: {
                 cpu: {cores: $cpu, sockets: 1, threads: 1, maxSockets: 1},
                 devices: {
-                  disks: [
-                    {name: "boot-disk", bootOrder: 1, disk: {bus: "virtio"}},
-                    {name: "data-disk", bootOrder: 2, disk: {bus: "virtio"}},
-                    {name: "cloudinitdisk", disk: {bus: "virtio"}}
-                  ],
+                  disks: (
+                    [{name: "boot-disk", bootOrder: 1, disk: {bus: "virtio"}}]
+                    + [
+                        $dataVolumes[]
+                        | {name: .volumeName, serial: .serial, disk: {bus: "virtio"}}
+                      ]
+                    + [{name: "cloudinitdisk", disk: {bus: "virtio"}}]
+                  ),
                   interfaces: [
                     {name: "default", model: "virtio", bridge: {}}
                   ]
@@ -1716,17 +1827,23 @@ create_iteration_vm() {
                 {name: "default", multus: {networkName: $networkName}}
               ],
               terminationGracePeriodSeconds: 20,
-              volumes: [
-                {name: "boot-disk", persistentVolumeClaim: {claimName: $bootPVC}},
-                {name: "data-disk", persistentVolumeClaim: {claimName: $dataPVC}},
-                {
+              volumes: (
+                [{name: "boot-disk", persistentVolumeClaim: {claimName: $bootPVC}}]
+                + [
+                    $dataVolumes[]
+                    | {
+                        name: .volumeName,
+                        persistentVolumeClaim: {claimName: .pvcName}
+                      }
+                  ]
+                + [{
                   name: "cloudinitdisk",
                   cloudInitNoCloud: {
                     userData: $cloudInitUserData,
                     networkData: $cloudInitNetworkData
                   }
-                }
-              ]
+                }]
+              )
             }
           }
         }
@@ -1748,12 +1865,25 @@ create_iteration_vm() {
       else . end
   ' >"$vm_json"
 
-	jq -e --arg annotation "$VOLUME_TEMPLATE_ANNOTATION" '
+	jq -e \
+		--arg annotation "$VOLUME_TEMPLATE_ANNOTATION" \
+		--arg dataPrefix "$DATA_VOLUME_PREFIX" \
+		--argjson dataCount "$DATA_VOLUME_COUNT" \
+		--argjson pvcCount "$((DATA_VOLUME_COUNT + 1))" '
       .apiVersion == "kubevirt.io/v1"
       and .kind == "VirtualMachine"
-      and ((.metadata.annotations[$annotation] | fromjson) | length == 2)
-      and ([.spec.template.spec.volumes[] | select(.persistentVolumeClaim? != null)] | length == 2)
+      and ((.metadata.annotations[$annotation] | fromjson) | length == $pvcCount)
+      and ([.spec.template.spec.volumes[] | select(.persistentVolumeClaim? != null)] | length == $pvcCount)
       and ([.spec.template.spec.volumes[] | select(.cloudInitNoCloud? != null)] | length == 1)
+      and ([
+        .spec.template.spec.domain.devices.disks[]
+        | select(.name | startswith($dataPrefix + "-"))
+      ] | length == $dataCount)
+      and ([
+        .spec.template.spec.domain.devices.disks[]
+        | select(.name | startswith($dataPrefix + "-"))
+        | .serial
+      ] | length == $dataCount and (unique | length == $dataCount))
     ' "$vm_json" >/dev/null || fail "generated VM manifest failed internal validation"
 
 	kubectl apply -f "$vm_json" >/dev/null
@@ -1771,15 +1901,24 @@ run_iteration() {
 	local retry_kind="vm"
 	local retry_reason=""
 	local VM_JSON=""
-	local DATA_PVC_NAME=""
 	local ROOT_PAYLOAD_NAME=""
-	local DATA_PAYLOAD_NAME=""
 	local ROOT_SOURCE_CHECKSUM=""
-	local DATA_SOURCE_CHECKSUM=""
-	local RESTORED_DATA_PVC=""
 	local ROOT_RESTORED_CHECKSUM=""
-	local DATA_RESTORED_CHECKSUM=""
+	local RESTORE_JSON=""
+	local data_index=0
+	local volume_name=""
+	local restored_pvc=""
+	local checksum=""
+	local restored_checksum=""
+	local device=""
+	local mount_path=""
 	local read_exit_code=0
+	local -a DATA_PVC_NAMES=()
+	local -a DATA_PAYLOAD_NAMES=()
+	local -a DATA_DEVICES=()
+	local -a DATA_MOUNTS=()
+	local -a DATA_SOURCE_CHECKSUMS=()
+	local -a DATA_RESTORED_CHECKSUMS=()
 
 	if ((attempt > 1)); then
 		attempt_suffix="-a${attempt}"
@@ -1792,9 +1931,13 @@ run_iteration() {
 	CURRENT_RESTORED_VM="$(resource_name "${RUN_ID}-worker-${worker}-restored-${iteration}${attempt_suffix}")"
 	VM_JSON="${STRESS_TMP_DIR}/worker-${worker}-vm-${iteration}${attempt_suffix}.json"
 	CURRENT_BOOT_PVC="${CURRENT_VM}-pvc-${BOOT_TEMPLATE_INDEX}"
-	DATA_PVC_NAME="${CURRENT_VM}-pvc-${DATA_TEMPLATE_INDEX}"
 	ROOT_PAYLOAD_NAME=".csi-stress-${RUN_ID}-${iteration_id}-root.bin"
-	DATA_PAYLOAD_NAME=".csi-stress-${RUN_ID}-${iteration_id}-data.bin"
+	for ((data_index = 1; data_index <= DATA_VOLUME_COUNT; data_index++)); do
+		DATA_PVC_NAMES[$data_index]="$(data_pvc_name "$CURRENT_VM" "$data_index")"
+		DATA_PAYLOAD_NAMES[$data_index]=".csi-stress-${RUN_ID}-${iteration_id}-data-${data_index}.bin"
+		DATA_DEVICES[$data_index]="$(guest_data_device "$data_index")"
+		DATA_MOUNTS[$data_index]="$(guest_data_mount "$data_index")"
+	done
 	CURRENT_FAILURE_CATEGORY="vm-creation-failure"
 	SSH_FAILURE_STAGE=""
 	LAST_SSH_ERROR=""
@@ -1820,14 +1963,17 @@ run_iteration() {
 		return 1
 	fi
 	label_boot_storage_resources "$CURRENT_BOOT_PVC" "$iteration_id"
-	if ! wait_for_resource pvc "$DATA_PVC_NAME" '.status.phase == "Bound"' "filesystem data PVC"; then
-		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
-			"$cdi_retries" vm \
-			"Data PVC provisioning failed for source VM ${CURRENT_VM}"; then
-			return 0
+	for ((data_index = 1; data_index <= DATA_VOLUME_COUNT; data_index++)); do
+		if ! wait_for_resource pvc "${DATA_PVC_NAMES[$data_index]}" \
+			'.status.phase == "Bound"' "data PVC ${data_index}/${DATA_VOLUME_COUNT}"; then
+			if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
+				"$cdi_retries" vm \
+				"Data PVC ${data_index} provisioning failed for source VM ${CURRENT_VM}"; then
+				return 0
+			fi
+			return 1
 		fi
-		return 1
-	fi
+	done
 	CURRENT_FAILURE_CATEGORY="vm-readiness-failure"
 	if ! wait_for_resource virtualmachines.kubevirt.io "$CURRENT_VM" '.status.ready == true' "source VM"; then
 		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
@@ -1854,11 +2000,21 @@ run_iteration() {
 		fail "invalid source root-disk checksum: ${ROOT_SOURCE_CHECKSUM@Q}"
 	log "Source root-disk checksum: ${ROOT_SOURCE_CHECKSUM}"
 
-	log "Writing ${DATA_SIZE_GIB} GiB of data to source data disk ${GUEST_DEVICE} in VM ${CURRENT_VM}"
-	DATA_SOURCE_CHECKSUM="$(write_guest_payload "$CURRENT_VM" "$DATA_PAYLOAD_NAME")"
-	[[ "$DATA_SOURCE_CHECKSUM" =~ ^[a-f0-9]{64}$ ]] ||
-		fail "invalid source data-disk checksum: ${DATA_SOURCE_CHECKSUM@Q}"
-	log "Source data-disk checksum: ${DATA_SOURCE_CHECKSUM}"
+	for ((data_index = 1; data_index <= DATA_VOLUME_COUNT; data_index++)); do
+		device="${DATA_DEVICES[$data_index]}"
+		mount_path="${DATA_MOUNTS[$data_index]}"
+		log "Writing ${DATA_SIZE_GIB} GiB to source data disk" \
+			"${data_index}/${DATA_VOLUME_COUNT} (${device}) in VM ${CURRENT_VM}"
+		checksum="$(write_guest_payload \
+			"$CURRENT_VM" \
+			"${DATA_PAYLOAD_NAMES[$data_index]}" \
+			"$device" \
+			"$mount_path")"
+		[[ "$checksum" =~ ^[a-f0-9]{64}$ ]] ||
+			fail "invalid source data-disk ${data_index} checksum: ${checksum@Q}"
+		DATA_SOURCE_CHECKSUMS[$data_index]="$checksum"
+		log "Source data-disk ${data_index} checksum: ${checksum}"
+	done
 
 	CURRENT_FAILURE_CATEGORY="snapshot-failure"
 	log "Creating VM snapshot ${NAMESPACE}/${CURRENT_BACKUP}"
@@ -1888,6 +2044,8 @@ run_iteration() {
 	wait_for_resource virtualmachinebackups.harvesterhci.io "$CURRENT_BACKUP" \
 		'.status.readyToUse == true' "VM snapshot" '.status.error.message? != null' \
 		"$SNAPSHOT_ERROR_GRACE_SECONDS"
+	verify_status_volumes virtualmachinebackups.harvesterhci.io \
+		"$CURRENT_BACKUP" volumeBackups "VM snapshot ${CURRENT_BACKUP}"
 
 	CURRENT_FAILURE_CATEGORY="source-vm-stop-failure"
 	log "Stopping source VM ${CURRENT_VM} before starting its restored copy"
@@ -1924,6 +2082,8 @@ run_iteration() {
     ' | kubectl apply -f - >/dev/null
 	wait_for_resource virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE" \
 		'.status.complete == true' "VM restore" '.status.error.message? != null'
+	verify_status_volumes virtualmachinerestores.harvesterhci.io \
+		"$CURRENT_RESTORE" restores "VM restore ${CURRENT_RESTORE}"
 	CURRENT_FAILURE_CATEGORY="restored-vm-readiness-failure"
 	if ! wait_for_resource virtualmachines.kubevirt.io "$CURRENT_RESTORED_VM" '.status.ready == true' "restored VM"; then
 		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
@@ -1935,19 +2095,31 @@ run_iteration() {
 	fi
 	label_restored_resources "$CURRENT_RESTORED_VM" "$iteration_id"
 
-	RESTORED_DATA_PVC="$(kubectl get virtualmachinerestores.harvesterhci.io "$CURRENT_RESTORE" -n "$NAMESPACE" -o json | jq -r --arg volume "$DATA_VOLUME_NAME" '
-      [.status.restores[]? | select(.volumeName == $volume)][0].persistentVolumeClaimSpec.metadata.name // empty
-    ')"
-	[[ -n "$RESTORED_DATA_PVC" ]] || fail "restore status does not contain a PVC for VM volume ${DATA_VOLUME_NAME}"
+	RESTORE_JSON="$(kubectl get virtualmachinerestores.harvesterhci.io \
+		"$CURRENT_RESTORE" -n "$NAMESPACE" -o json)"
 	CURRENT_FAILURE_CATEGORY="restored-storage-provisioning-failure"
-	if ! wait_for_resource pvc "$RESTORED_DATA_PVC" '.status.phase == "Bound"' "restored filesystem data PVC"; then
-		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
-			"$cdi_retries" vm \
-			"Data PVC provisioning failed for restored VM ${CURRENT_RESTORED_VM}"; then
-			return 0
+	for ((data_index = 1; data_index <= DATA_VOLUME_COUNT; data_index++)); do
+		volume_name="$(data_volume_name "$data_index")"
+		restored_pvc="$(jq -r --arg volume "$volume_name" '
+          [.status.restores[]? | select(.volumeName == $volume)]
+          | if length == 1 then
+              .[0].persistentVolumeClaimSpec.metadata.name // empty
+            else
+              empty
+            end
+        ' <<<"$RESTORE_JSON")"
+		[[ -n "$restored_pvc" ]] ||
+			fail "restore status does not contain exactly one PVC for VM volume ${volume_name}"
+		if ! wait_for_resource pvc "$restored_pvc" '.status.phase == "Bound"' \
+			"restored data PVC ${data_index}/${DATA_VOLUME_COUNT}"; then
+			if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
+				"$cdi_retries" vm \
+				"Data PVC ${data_index} provisioning failed for restored VM ${CURRENT_RESTORED_VM}"; then
+				return 0
+			fi
+			return 1
 		fi
-		return 1
-	fi
+	done
 	CURRENT_FAILURE_CATEGORY="restored-guest-readiness-failure"
 	if ! wait_for_guest_ssh "$CURRENT_RESTORED_VM"; then
 		if retry_iteration "$worker" "$iteration" "$attempt" "$vm_retries" \
@@ -1975,31 +2147,48 @@ run_iteration() {
 	fi
 	log "Restored root-disk checksum: ${ROOT_RESTORED_CHECKSUM}"
 
-	log "Checking data checksum on restored data disk ${GUEST_DEVICE} in VM ${CURRENT_RESTORED_VM}"
-	if DATA_RESTORED_CHECKSUM="$(read_guest_payload "$CURRENT_RESTORED_VM" "$DATA_PAYLOAD_NAME")"; then
-		:
-	else
-		read_exit_code=$?
-		if ((read_exit_code == 75)); then
-			CURRENT_FAILURE_CATEGORY="integrity-transport-failure"
+	for ((data_index = 1; data_index <= DATA_VOLUME_COUNT; data_index++)); do
+		device="${DATA_DEVICES[$data_index]}"
+		mount_path="${DATA_MOUNTS[$data_index]}"
+		log "Checking checksum on restored data disk" \
+			"${data_index}/${DATA_VOLUME_COUNT} (${device}) in VM ${CURRENT_RESTORED_VM}"
+		if checksum="$(read_guest_payload \
+			"$CURRENT_RESTORED_VM" \
+			"${DATA_PAYLOAD_NAMES[$data_index]}" \
+			"$device" \
+			"$mount_path")"; then
+			:
+		else
+			read_exit_code=$?
+			if ((read_exit_code == 75)); then
+				CURRENT_FAILURE_CATEGORY="integrity-transport-failure"
+			fi
+			return "$read_exit_code"
 		fi
-		return "$read_exit_code"
-	fi
-	if [[ ! "$DATA_RESTORED_CHECKSUM" =~ ^[a-f0-9]{64}$ ]]; then
-		CURRENT_FAILURE_CATEGORY="integrity-output-failure"
-		fail "invalid restored data-disk checksum: ${DATA_RESTORED_CHECKSUM@Q}"
-	fi
-	log "Restored data-disk checksum: ${DATA_RESTORED_CHECKSUM}"
+		if [[ ! "$checksum" =~ ^[a-f0-9]{64}$ ]]; then
+			CURRENT_FAILURE_CATEGORY="integrity-output-failure"
+			fail "invalid restored data-disk ${data_index} checksum: ${checksum@Q}"
+		fi
+		DATA_RESTORED_CHECKSUMS[$data_index]="$checksum"
+		log "Restored data-disk ${data_index} checksum: ${checksum}"
+	done
 
 	if [[ "$ROOT_SOURCE_CHECKSUM" != "$ROOT_RESTORED_CHECKSUM" ]]; then
 		CURRENT_FAILURE_CATEGORY="integrity-mismatch"
 		fail "root-disk integrity failure in ${iteration_id}: source=${ROOT_SOURCE_CHECKSUM}, restored=${ROOT_RESTORED_CHECKSUM}"
 	fi
-	if [[ "$DATA_SOURCE_CHECKSUM" != "$DATA_RESTORED_CHECKSUM" ]]; then
+	for ((data_index = 1; data_index <= DATA_VOLUME_COUNT; data_index++)); do
+		checksum="${DATA_SOURCE_CHECKSUMS[$data_index]}"
+		restored_checksum="${DATA_RESTORED_CHECKSUMS[$data_index]}"
+		if [[ "$checksum" == "$restored_checksum" ]]; then
+			continue
+		fi
 		CURRENT_FAILURE_CATEGORY="integrity-mismatch"
-		fail "data-disk integrity failure in ${iteration_id}: source=${DATA_SOURCE_CHECKSUM}, restored=${DATA_RESTORED_CHECKSUM}"
-	fi
-	log "Iteration ${iteration} passed root- and data-disk integrity verification"
+		fail "data-disk ${data_index} integrity failure in ${iteration_id}:" \
+			"source=${checksum}, restored=${restored_checksum}"
+	done
+	log "Iteration ${iteration} passed root-disk and ${DATA_VOLUME_COUNT}" \
+		"data-disk integrity verification"
 }
 
 worker_on_exit() {

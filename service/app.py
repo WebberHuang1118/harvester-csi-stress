@@ -148,8 +148,19 @@ PARAMETERS = [
         "modes": ["stress"],
     },
     {
+        "key": "data_volume_count",
+        "label": "Data PVC count",
+        "type": "number",
+        "default": 1,
+        "min": 1,
+        "required": True,
+        "group": "VM and storage",
+        "modes": ["stress"],
+        "help": "Number of identical data disks attached to every test VM.",
+    },
+    {
         "key": "data_volume_size_gib",
-        "label": "Data PVC capacity",
+        "label": "Capacity per data PVC",
         "type": "number",
         "default": 100,
         "min": 1,
@@ -260,6 +271,7 @@ PARAMETERS = [
         "required": True,
         "group": "Workload",
         "modes": ["stress"],
+        "help": "Random payload written independently to every data disk.",
     },
     {
         "key": "root_data_size_gib",
@@ -380,6 +392,10 @@ PARAMETERS = [
         "required": True,
         "group": "Guest access",
         "modes": ["stress"],
+        "help": (
+            "Device used when the data PVC count is 1. Multi-disk runs resolve "
+            "each disk by its generated virtio serial."
+        ),
     },
     {
         "key": "guest_mount_path",
@@ -389,6 +405,10 @@ PARAMETERS = [
         "required": True,
         "group": "Guest access",
         "modes": ["stress"],
+        "help": (
+            "Mount point for one data disk, or the parent directory containing "
+            "disk-1 through disk-N for multi-disk runs."
+        ),
     },
     {
         "key": "keep_resources",
@@ -585,6 +605,7 @@ def build_command(config: dict[str, Any]) -> list[str]:
             ("--cpu", "cpu"),
             ("--memory", "memory"),
             ("--boot-size-gib", "boot_size_gib"),
+            ("--data-volume-count", "data_volume_count"),
             ("--data-volume-size-gib", "data_volume_size_gib"),
             ("--boot-volume-mode", "boot_volume_mode"),
             ("--data-volume-mode", "data_volume_mode"),
